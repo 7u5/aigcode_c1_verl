@@ -1,0 +1,7 @@
+python benchmarks/run_benchmarks.py \
+    --model_path /path/to/vapo_dapo_grm \
+    --reward_model_path /path/to/reward_model \
+    --value_model_path /path/to/value_model \
+    --dataset_name beyond_aime \
+    --output_file results_beyond_aime.json \
+    --opencompass_dir /path/to/opencompass
