@@ -2,7 +2,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from verl.algorithms.dpo import DPO
+#from verl.algorithms.dpo import DPO
+import os
 from verl.utils.megatron import get_tokenizer
 
 class ValueModel(nn.Module):
@@ -27,7 +28,7 @@ class ComplexityEstimator:
         beta = self.base_beta + 0.01 * variance
         return max(self.min_beta, min(self.max_beta, beta))
 
-class AIGCode_C1(DPO):
+class AIGCode_C1:
     def __init__(self, model, reward_model, value_model, initial_beta=0.1, lambda_weight=0.5, meta_lr=1e-5, tokenizer=None):
         super().__init__(model, reward_model)
         self.value_model = ValueModel(value_model) if value_model else None

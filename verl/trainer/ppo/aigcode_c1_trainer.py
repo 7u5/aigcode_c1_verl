@@ -1,13 +1,48 @@
-# verl/trainer/ppo/aigcode_c1_trainer.py
+# Copyright 2024 AIGCode Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+FSDP PPO Trainer with Ray-based single controller, enhanced with meta-learning, DAPO, and VAPO.
+This trainer supports model-agnostic model initialization with HuggingFace.
+"""
+
+import os
+import uuid
+from collections import defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass, field
+from enum import Enum
+from pprint import pprint
+from typing import Dict, List, Tuple, Type
 
 import numpy as np
 import ray
 import torch
+from codetiming import Timer
+from omegaconf import OmegaConf, open_dict
+from torch.utils.data import Dataset, RandomSampler, SequentialSampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role
-
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role, AdvantageEstimator, ResourcePoolManager, apply_kl_penalty, _timer, compute_response_mask, compute_advantage, WorkerType
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.single_controller.base import Worker
+from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -15,20 +50,25 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
     reduce_metrics,
 )
-from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_advantage, _timer, apply_kl_penalty, compute_reward, compute_reward_async, AdvantageEstimator, compute_response_mask, uuid
-#from verl.single_controller.ray.actor_rollout_worker import ActorRolloutWorker
+from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.torch_functional import masked_mean
+from verl.utils.tracking import ValidationGenerationsLogger
 
 class AIGCodeC1Trainer(RayPPOTrainer):
-    def __init__(self, config, **kwargs):
-        if "role_worker_mapping" in kwargs:
-            if config.actor_rollout_ref.actor.strategy == "fsdp":
-                from verl.workers.fsdp_workers import ActorRolloutRefWorker
-            elif config.actor_rollout_ref.actor.strategy == "megatron":
-                from verl.workers.megatron_workers import ActorRolloutRefWorker
-            kwargs["role_worker_mapping"][Role.ActorRollout] = ActorRolloutRefWorker
-        super().__init__(config, **kwargs)
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, ray.actor.ActorClass],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+    ):
         self.meta_lr = config.meta_learning.meta_lr
         self.inner_lr = config.meta_learning.inner_lr
         self.meta_steps = config.meta_learning.meta_steps
@@ -36,76 +76,228 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         self.use_vapo = config.algorithm.use_vapo
         self.use_preference = config.algorithm.use_preference
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-    def _compute_preference_loss(self, batch: DataProto, model):
-        # DAPO: Compute preference loss based on paired data
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.config = config
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
+        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        assert self.hybrid_engine, "Currently, only support hybrid engine"
+
+        if not ray.is_initialized():
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            ray.init(
+                num_gpus=num_gpus,
+                runtime_env={
+                    "env_vars": {
+                        "TOKENIZERS_PARALLELISM": "true",
+                        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                    }
+                },
+            )
+            print(f"Ray initialized with {num_gpus} GPUs")
+
+        print("Role worker mapping:", role_worker_mapping)
+        self.role_worker_mapping = role_worker_mapping
+        self.resource_pool_manager = resource_pool_manager
+        self.use_reference_policy = (
+            config.actor_rollout_ref.ref.log_prob_micro_batch_size
+            or config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu
+        )
+        self.use_rm = config.reward_model.enable
+        self.ray_worker_group_cls = ray_worker_group_cls
+        self.validation_generations_logger = ValidationGenerationsLogger()
+
+        if config.algorithm.use_kl_in_reward:
+            self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
+
+        self.use_critic = config.algorithm.adv_estimator == AdvantageEstimator.GAE
+        if not self.use_critic and config.algorithm.adv_estimator not in [
+            AdvantageEstimator.GRPO,
+            AdvantageEstimator.REINFORCE_PLUS_PLUS,
+            AdvantageEstimator.REMAX,
+            AdvantageEstimator.RLOO,
+            AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+        ]:
+            raise NotImplementedError(f"Unsupported advantage estimator: {config.algorithm.adv_estimator}")
+
+        self._validate_config()
+        self._create_dataloader()
+
+    def _compute_preference_loss(self, batch: DataProto):
+        if not self.use_preference:
+            return torch.tensor(0.0, device=self.device)
         pos_batch, neg_batch = batch.split_pairs()
-        pos_log_probs = model.compute_log_prob(pos_batch)
-        neg_log_probs = model.compute_log_prob(neg_batch)
-        loss = -torch.mean(torch.log(torch.sigmoid(pos_log_probs - neg_log_probs)))
+        if pos_batch is None or neg_batch is None:
+            return torch.tensor(0.0, device=self.device)
+        pos_log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))["log_probs"]
+        neg_log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))["log_probs"]
+        logits = pos_log_probs - neg_log_probs
+        logits = torch.clamp(logits, -10, 10)
+        loss = -torch.mean(torch.log(torch.sigmoid(logits)))
         return loss
 
-    def _compute_value_aware_loss(self, batch: DataProto, model):
-        # VAPO: Compute value-aware loss
-        values = self.critic_wg.compute_values(batch)
+    def _compute_value_aware_loss(self, batch: DataProto):
+        if not self.use_vapo:
+            return torch.tensor(0.0, device=self.device)
+        values = ray.get(self.critic_wg.compute_values.remote(batch))
+        values = (values - values.mean()) / (values.std() + 1e-8)
         advantages = batch.batch["advantages"]
-        log_probs = model.compute_log_prob(batch)
+        log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
         value_aware_loss = -torch.mean(log_probs * advantages * values)
         return value_aware_loss
 
-    def _inner_loop_adaptation(self, batch: DataProto, model_ref):
-        # Inner loop for meta-learning
-        model = deepcopy(model_ref)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.inner_lr)
+    def _inner_loop_adaptation(self, batch: DataProto):
+        try:
+            model_state = ray.get(self.actor_rollout_wg.get_model_state.remote())
+        except AttributeError as e:
+            raise RuntimeError("Actor worker does not support get_model_state") from e
+
+        optimizer = torch.optim.Adam(model_state["parameters"], lr=self.inner_lr)
 
         for _ in range(self.inner_steps):
             optimizer.zero_grad()
             loss = 0
             if self.use_preference:
-                loss += self._compute_preference_loss(batch, model)
+                loss += self._compute_preference_loss(batch)
             if self.use_vapo:
-                loss += self._compute_value_aware_loss(batch, model)
+                loss += self._compute_value_aware_loss(batch)
             else:
-                log_probs = model.compute_log_prob(batch)
+                log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
                 advantages = batch.batch["advantages"]
                 loss += -torch.mean(log_probs * advantages)
             loss.backward()
             optimizer.step()
 
-        return model
+        return model_state
 
     def _get_worker_parameters(self, worker):
-        print(f"Worker type: {type(worker)}")
-        print(f"Worker methods: {dir(worker)}")
-        print(f"get_model_parameters type: {type(worker.get_model_parameters)}")
         try:
-            print(f"get_model_parameters __self__: {worker.get_model_parameters.__self__}")
-            print(f"get_model_parameters __qualname__: {worker.get_model_parameters.__qualname__}")
-            print(f"get_model_parameters has remote: {hasattr(worker.get_model_parameters, 'remote')}")
+            params = ray.get(worker.get_model_parameters.remote())
+            return params
         except AttributeError as e:
-            print(f"Error inspecting get_model_parameters: {e}")
-        if hasattr(worker, 'workers'):
-            for i, w in enumerate(worker.workers):
-                print(f"Worker {i} type: {type(w)}")
-                print(f"Worker {i} methods: {dir(w)}")
-                try:
-                    if hasattr(w, 'get_model_parameters'):
-                        method_type = type(w.get_model_parameters)
-                        print(f"Worker {i} get_model_parameters type: {method_type}")
-                        print(f"Worker {i} get_model_parameters __self__: {w.get_model_parameters.__self__}")
-                        print(f"Worker {i} get_model_parameters __qualname__: {w.get_model_parameters.__qualname__}")
-                        print(f"Worker {i} get_model_parameters has remote: {hasattr(w.get_model_parameters, 'remote')}")
-                    else:
-                        print(f"Worker {i} get_model_parameters: Not found")
-                except Exception as e:
-                    print(f"Worker {i} get_model_parameters error: {e}")
+            raise RuntimeError(f"Worker {worker} does not support get_model_parameters") from e
+
+    def _set_worker_parameters(self, worker, params):
         try:
-            print(f"Attempting to call worker.get_model_parameters.remote()")
-            worker_params = ray.get(worker.get_model_parameters)
+            ray.get(worker.set_model_parameters.remote(params))
         except AttributeError as e:
-            print(f"Error calling get_model_parameters.remote(): {e}")
-            raise
-        return worker_params
+            raise RuntimeError(f"Worker {worker} does not support set_model_parameters") from e
+
+    def _validate_config(self):
+        config = self.config
+        n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        assert real_train_batch_size % n_gpus == 0, (
+            f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        )
+
+        def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+            settings = {
+                "actor_rollout_ref.actor": "micro_batch_size",
+                "critic": "micro_batch_size",
+                "reward_model": "micro_batch_size",
+                "actor_rollout_ref.ref": "log_prob_micro_batch_size",
+                "actor_rollout_ref.rollout": "log_prob_micro_batch_size",
+            }
+            if name in settings:
+                param = settings[name]
+                param_per_gpu = f"{param}_per_gpu"
+                if mbs is None and mbs_per_gpu is None:
+                    raise ValueError(
+                        f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'."
+                    )
+                if mbs is not None and mbs_per_gpu is not None:
+                    raise ValueError(
+                        f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. "
+                        f"Please remove '{name}.{param}' because only '*_{param_per_gpu}' is supported."
+                    )
+
+        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+            check_mutually_exclusive(
+                config.actor_rollout_ref.actor.ppo_micro_batch_size,
+                config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
+                "actor_rollout_ref.actor",
+            )
+            if self.use_reference_policy:
+                check_mutually_exclusive(
+                    config.actor_rollout_ref.ref.log_prob_micro_batch_size,
+                    config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
+                    "actor_rollout_ref.ref",
+                )
+            check_mutually_exclusive(
+                config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
+                config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                "actor_rollout_ref.rollout",
+            )
+
+        if self.use_critic and not config.critic.use_dynamic_bsz:
+            check_mutually_exclusive(
+                config.critic.ppo_micro_batch_size, config.critic.ppo_micro_batch_size_per_gpu, "critic"
+            )
+
+        if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
+            check_mutually_exclusive(
+                config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
+            )
+
+        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+            assert config.data.train_batch_size >= config.actor_rollout_ref.actor.ppo_mini_batch_size
+            sp_size = config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
+            if config.actor_rollout_ref.actor.ppo_micro_batch_size is not None:
+                assert (
+                    config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    % config.actor_rollout_ref.actor.ppo_micro_batch_size
+                    == 0
+                )
+                assert config.actor_rollout_ref.actor.ppo_micro_batch_size * sp_size >= n_gpus
+
+        assert config.actor_rollout_ref.actor.loss_agg_mode in [
+            "token-mean",
+            "seq-mean-token-sum",
+            "seq-mean-token-mean",
+            "seq-mean-token-sum-norm",
+        ], f"Invalid loss_agg_mode: {config.actor_rollout_ref.actor.loss_agg_mode}"
+
+        if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
+            print("NOTICE: You have both enabled in-reward KL and KL loss.")
+
+        if self.use_critic and not config.critic.use_dynamic_bsz:
+            assert config.data.train_batch_size >= config.critic.ppo_mini_batch_size
+            sp_size = config.critic.get("ulysses_sequence_parallel_size", 1)
+            if config.critic.ppo_micro_batch_size is not None:
+                assert config.critic.ppo_mini_batch_size % config.critic.ppo_micro_batch_size == 0
+                assert config.critic.ppo_micro_batch_size * sp_size >= n_gpus
+
+        if config.actor_rollout_ref.actor.strategy == "fsdp" and (
+            config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1) > 1
+            or config.actor_rollout_ref.ref.get("ulysses_sequence_parallel_size", 1) > 1
+        ):
+            assert config.actor_rollout_ref.model.use_remove_padding, (
+                "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+            )
+
+        if self.use_critic and config.critic.strategy == "fsdp":
+            if config.critic.get("ulysses_sequence_parallel_size", 1) > 1:
+                assert config.critic.model.use_remove_padding, (
+                    "When using sequence parallelism for critic, you must enable `use_remove_padding`."
+                )
+
+        if config.data.get("val_batch_size", None) is not None:
+            print(
+                "WARNING: val_batch_size is deprecated. "
+                "Validation datasets are sent to inference engines as a whole batch."
+            )
+
+        if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
+            assert config.actor_rollout_ref.rollout.temperature > 0, (
+                "Validation gen temperature should be greater than 0 when enabling do_sample"
+            )
+
+        #if self.use_preference and not hasattr(self.train_dataset, "split_pairs"):
+        #    raise ValueError("Dataset must support split_pairs for preference optimization (DAPO).")
+
+        print("[validate_config] All configuration checks passed successfully!")
 
     def fit(self):
         from omegaconf import OmegaConf
@@ -123,25 +315,16 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
-            print(f"Initial validation metrics: {val_metrics}")
+            pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
-        try:
-            actor_parameters = self._get_worker_parameters(self.actor_rollout_wg)
-        except Exception as e:
-            print(f"Error in _get_worker_parameters: {e}")
-            raise
-        
+        meta_optimizer = torch.optim.Adam(self._get_worker_parameters(self.actor_rollout_wg), lr=self.meta_lr)
+
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
         self.global_steps += 1
         last_val_metrics = None
-
-        # Get parameters for meta-optimizer
-        #actor_parameters = self._get_worker_parameters(self.actor_rollout_wg)
-
-        meta_optimizer = torch.optim.Adam(actor_parameters, lr=self.meta_lr)
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -163,14 +346,13 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                 with _timer("step", timing_raw):
                     with _timer("gen", timing_raw):
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_output = ray.get(self.actor_rollout_wg.generate_sequences.remote(gen_batch))
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                            gen_baseline_output = ray.get(self.actor_rollout_wg.generate_sequences.remote(gen_baseline_batch))
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
@@ -192,7 +374,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                     with _timer("reward", timing_raw):
                         if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            reward_tensor = ray.get(self.rm_wg.compute_rm_score.remote(batch))
                             batch = batch.union(reward_tensor)
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
@@ -200,8 +382,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     with _timer("old_log_prob", timing_raw):
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        old_log_prob = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -215,14 +396,12 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                     if self.use_reference_policy:
                         with _timer("ref", timing_raw):
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            ref_log_prob = ray.get(self.ref_policy_wg.compute_ref_log_prob.remote(batch))
                             batch = batch.union(ref_log_prob)
 
                     if self.use_critic:
                         with _timer("values", timing_raw):
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                values = self.critic_wg.compute_values(batch)
+                            values = ray.get(self.critic_wg.compute_values.remote(batch))
                             batch = batch.union(values)
 
                     with _timer("adv", timing_raw):
@@ -252,24 +431,32 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output = ray.get(self.critic_wg.update_critic.remote(batch))
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        with _timer("update_actor", timing_raw):
+                            actor_output = ray.get(self.actor_rollout_wg.update_actor.remote(batch))
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
                         with _timer("meta_update", timing_raw):
                             meta_optimizer.zero_grad()
-                            # Perform meta-learning
                             for _ in range(self.meta_steps):
-                                adapted_model = self._inner_loop_adaptation(batch, self.actor_rollout_wg)
+                                adapted_state = self._inner_loop_adaptation(batch)
+                                self._set_worker_parameters(self.actor_rollout_wg, adapted_state["parameters"])
                                 meta_loss = (
-                                    self._compute_value_aware_loss(batch, adapted_model)
+                                    self._compute_value_aware_loss(batch)
                                     if self.use_vapo
-                                    else -torch.mean(adapted_model.compute_log_prob(batch) * batch.batch["advantages"])
+                                    else -torch.mean(
+                                        ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
+                                        * batch.batch["advantages"]
+                                    )
                                 )
                                 meta_loss.backward()
                             meta_optimizer.step()
+                            self._set_worker_parameters(self.actor_rollout_wg, meta_optimizer.param_groups[0]["params"])
 
                     if (
                         self.val_reward_fn is not None
@@ -296,7 +483,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
-                    print(f"Final validation metrics: {last_val_metrics}")
+                    pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 
