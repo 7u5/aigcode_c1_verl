@@ -198,10 +198,10 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             collate_fn=collate_fn,
             sampler=sampler,
         )
-
+        print(dataset_config.val_files)
         self.val_dataset = dataset_cls(
             data_files=dataset_config.val_files,
-            dataset_name=dataset_config.get("dataset_name"),
+            #dataset_name=dataset_config.get("dataset_name"),
             tokenizer=self.tokenizer,
             processor=self.processor,
             config=dataset_config,

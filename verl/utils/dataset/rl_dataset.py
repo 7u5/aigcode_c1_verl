@@ -36,8 +36,55 @@ from datasets import load_dataset
 
 #from verl.utils.text.tokenizer import load_tokenizer
 
+def collate_fn(batch):
+    import torch
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
 
-def collate_fn(data_list: List[Dict]) -> Dict:
+    logger.info(f"Collating batch of size {len(batch)}")
+    if not batch:
+        logger.error("Empty batch received in collate_fn")
+        return {}
+
+    tensors = {}
+    try:
+        required_keys = ['input_ids', 'attention_mask']  # Adjust based on expected keys
+        if not all(key in batch[0] for key in required_keys):
+            logger.error(f"Batch missing required keys: {required_keys}")
+            return {}
+
+        for key in batch[0].keys():
+            val = [item[key] for item in batch if key in item and item[key] is not None]
+            if not val:
+                logger.warning(f"No valid data for key {key} in batch")
+                continue
+            if isinstance(val[0], torch.Tensor):
+                # Check for empty tensors
+                val = [v for v in val if v.numel() > 0]
+                if not val:
+                    logger.warning(f"All tensors for key {key} are empty")
+                    continue
+                try:
+                    tensors[key] = torch.nn.utils.rnn.pad_sequence(val, batch_first=True, padding_value=0)
+                except Exception as e:
+                    logger.error(f"Failed to pad sequence for key {key}: {e}")
+                    continue
+            else:
+                tensors[key] = val
+        if not tensors:
+            logger.error("No valid tensors in batch after processing")
+            return {}
+        logger.info(f"Collated batch keys: {list(tensors.keys())}")
+        return tensors
+    except Exception as e:
+        logger.error(f"Failed to collate batch: {e}")
+        return {}
+    
+def collate_fn_bak(data_list: List[Dict]) -> Dict:
     """Collate function for RLHFDataset."""
     tensors = defaultdict(list)
     non_tensors = defaultdict(list)
