@@ -32,7 +32,7 @@ import ray
 import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
-from torch.utils.data import Dataset, RandomSampler, SequentialSampler, DataLoader, DistributedSampler
+from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role, AdvantageEstimator, ResourcePoolManager, apply_kl_penalty, _timer, compute_response_mask, compute_advantage, WorkerType
@@ -42,7 +42,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss, compute_difficulty_coeff
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -52,17 +52,10 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-import os
-if os.environ.get('EXP_NAME') == 'deepseek_7b_megatron_test':
-    from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
-    from verl.utils.dataset.rl_dataset import PreferencePairDataset
-else:
-    from verl.utils.dataset.rl_dataset_zj import RLHFDataset, collate_fn
-
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-
 
 class AIGCodeC1Trainer(RayPPOTrainer):
     def __init__(
@@ -90,8 +83,6 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         self.val_reward_fn = val_reward_fn
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
-
-            
 
         if not ray.is_initialized():
             num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -133,221 +124,30 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         self._validate_config()
         self._create_dataloader()
 
-    def _meta_rm_score(self, log_probs: torch.Tensor, batch: 'DataProto') -> torch.Tensor:
-        """Placeholder for meta RM: scores sample quality based on log-prob variance."""
-        # Simulate meta RM by scoring samples based on stability (e.g., low variance)
-        variance = torch.var(log_probs, dim=-1, keepdim=True)
-        scores = 1.0 / (1.0 + variance)  # Higher score for lower variance
-        return torch.clamp(scores, 0.0, 1.0)
+    def _compute_preference_loss(self, batch: DataProto):
+        if not self.use_preference:
+            return torch.tensor(0.0, device=self.device)
+        pos_batch, neg_batch = batch.split_pairs()
+        if pos_batch is None or neg_batch is None:
+            return torch.tensor(0.0, device=self.device)
+        pos_log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))["log_probs"]
+        neg_log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))["log_probs"]
+        logits = pos_log_probs - neg_log_probs
+        logits = torch.clamp(logits, -10, 10)
+        loss = -torch.mean(torch.log(torch.sigmoid(logits)))
+        return loss
 
-    def load_data(self):
-        """Load and preprocess preference pair dataset."""
-        self.dataset = PreferencePairDataset(
-            dataset_name="lmsys/lmsys-chat-1m",
-            tokenizer_name=self.tokenizer_name,
-            reward_model_name=self.reward_model_name,
-            max_length=self.max_length,
-            cache_dir="/home/aigc/.cache/huggingface/hub"
-        )
-        self.dataset.preprocess(mode="k_fold")
-        
-        # Generate initial curriculum
-        agent_performance = [self.evaluate_task(i) for i in range(len(self.dataset))]  # Hypothetical
-        curriculum = self.dataset.generate_curriculum(agent_performance, mode="zpd")
-        
-        # Create distributed DataLoader
-        sampler = DistributedSampler(self.dataset)
-        self.dataloader = DataLoader(self.dataset, batch_size=self.batch_size, sampler=sampler)
-
-
-    def _create_dataloader(self):
-        dataset_cls = RLHFDataset
-        dataset_config = self.config.data
-
-        self.train_dataset = dataset_cls(
-            data_files=dataset_config.train_files,
-            dataset_name=dataset_config.get("dataset_name"),
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            config=dataset_config,
-            reward_model_name=self.config.get("reward_model", {}).get("model_path"),
-            cache_dir=dataset_config.get("cache_dir", "~/.cache/verl/rlhf"),
-            max_length=dataset_config.max_prompt_length,
-            difficulty_mode=self.config.algorithm.get("difficulty_mode", "k_fold")
-        )
-
-        # Check if train dataset is empty
-        if len(self.train_dataset) == 0:
-            raise ValueError(
-                f"Training dataset is empty. Check the data file: {dataset_config.train_files}. "
-                "Ensure the file exists, is non-empty, and contains valid data."
-            )
-
-        if dataset_config.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(dataset_config.get("seed", 1))
-            sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(data_source=self.train_dataset)
-
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=dataset_config.get("gen_batch_size", dataset_config.train_batch_size),
-            num_workers=8,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=sampler,
-        )
-
-        self.val_dataset = dataset_cls(
-            data_files=dataset_config.val_files,
-            dataset_name=dataset_config.get("dataset_name"),
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            config=dataset_config,
-            #reward_model_name=self.config.get("reward_model", {}).get("model_path"),
-            reward_model_name=None,
-            cache_dir=dataset_config.get("cache_dir", "~/.cache/verl/rlhf"),
-            max_length=dataset_config.max_prompt_length,
-            difficulty_mode=self.config.algorithm.get("difficulty_mode", "k_fold")
-        )
-
-        # Check if validation dataset is empty
-        if len(self.val_dataset) == 0:
-            raise ValueError(
-                f"Validation dataset is empty. Check the data file: {dataset_config.val_files}. "
-                "Ensure the file exists, is non-empty, and contains valid data."
-            )
-
-        val_batch_size = dataset_config.val_batch_size or len(self.val_dataset)
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=8,
-            shuffle=False,
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-
-        print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, "
-            f"Size of val dataloader: {len(self.val_dataloader)}"
-        )
-
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
-
-        OmegaConf.set_struct(self.config, True)
-        with open_dict(self.config):
-            self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-            self.config.critic.optim.total_training_steps = total_training_steps
-                
-        def _compute_preference_loss(self, batch: 'DataProto') -> torch.Tensor:
-            if not self.use_preference:
-                return torch.tensor(0.0, device=self.device)
-
-            pos_batch, neg_batch = batch.split_pairs()
-            if pos_batch is None or neg_batch is None:
-                return torch.tensor(0.0, device=self.device)
-
-            # Generate multiple samples for positive and negative batches
-            pos_log_probs_samples = []
-            neg_log_probs_samples = []
-            for _ in range(self.num_samples):
-                pos_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))
-                neg_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))
-                pos_log_probs_samples.append(pos_result["log_probs"])
-                neg_log_probs_samples.append(neg_result["log_probs"])
-
-            # Stack samples: [num_samples, batch_size]
-            pos_log_probs_samples = torch.stack(pos_log_probs_samples, dim=0)
-            neg_log_probs_samples = torch.stack(neg_log_probs_samples, dim=0)
-
-            # Compute meta RM scores for each sample
-            pos_scores = self._meta_rm_score(pos_log_probs_samples, pos_batch)
-            neg_scores = self._meta_rm_score(neg_log_probs_samples, neg_batch)
-
-            # Filter samples: keep those with scores > threshold (e.g., 0.5)
-            threshold = 0.5
-            pos_mask = pos_scores > threshold
-            neg_mask = neg_scores > threshold
-            pos_log_probs_filtered = pos_log_probs_samples[pos_mask]
-            neg_log_probs_filtered = neg_log_probs_samples[neg_mask]
-
-            # If no samples pass the threshold, use mean as fallback
-            if pos_log_probs_filtered.numel() == 0:
-                pos_log_probs_filtered = pos_log_probs_samples.mean(dim=0, keepdim=True)
-                pos_scores = torch.ones_like(pos_scores[0:1])
-            if neg_log_probs_filtered.numel() == 0:
-                neg_log_probs_filtered = neg_log_probs_samples.mean(dim=0, keepdim=True)
-                neg_scores = torch.ones_like(neg_scores[0:1])
-
-            # Voting: Weighted average based on meta RM scores
-            pos_weights = pos_scores[pos_mask] / pos_scores[pos_mask].sum()
-            neg_weights = neg_scores[neg_mask] / neg_scores[neg_mask].sum()
-            pos_log_probs = torch.sum(pos_log_probs_filtered * pos_weights.view(-1, 1), dim=0)
-            neg_log_probs = torch.sum(neg_log_probs_filtered * neg_weights.view(-1, 1), dim=0)
-
-            # Apply difficulty coefficient (delta) from batch
-            difficulty_coeff = compute_difficulty_coeff(
-                log_probs=pos_log_probs_samples.mean(0),
-                values=ray.get(self.critic_wg.compute_values.remote(pos_batch)),
-                rewards=pos_batch.batch["rewards"],
-                response_mask=pos_batch.batch["response_mask"],
-                task_features={"seq_length": pos_batch.batch["seq_length"], "reward_sparsity": 0.5},
-                mode="k_fold"
-            )
-            batch.batch.set("difficulty_coeff", torch.tensor(difficulty_coeff, device=self.device))
-            #delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
-            delta = difficulty_coeff
-            logits = delta * (pos_log_probs - neg_log_probs)
-            logits = torch.clamp(logits, -10, 10)
-            loss = -torch.mean(torch.log(torch.sigmoid(logits)))
-            return loss
-
-    def _compute_value_aware_loss(self, batch: 'DataProto') -> torch.Tensor:
+    def _compute_value_aware_loss(self, batch: DataProto):
         if not self.use_vapo:
             return torch.tensor(0.0, device=self.device)
-        # Compute values
         values = ray.get(self.critic_wg.compute_values.remote(batch))
         values = (values - values.mean()) / (values.std() + 1e-8)
         advantages = batch.batch["advantages"]
-
-        # Generate multiple samples for log-probabilities
-        log_probs_samples = []
-        for _ in range(self.num_samples):
-            result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
-            log_probs_samples.append(result["log_probs"])
-
-        # Stack samples: [num_samples, batch_size]
-        log_probs_samples = torch.stack(log_probs_samples, dim=0)
-
-        # Compute meta RM scores
-        scores = self._meta_rm_score(log_probs_samples, batch)
-
-        # Filter samples
-        mask = scores > 0.5
-        log_probs_filtered = log_probs_samples[mask]
-
-        # Fallback to mean if no samples pass
-        if log_probs_filtered.numel() == 0:
-            log_probs_filtered = log_probs_samples.mean(dim=0, keepdim=True)
-            scores = torch.ones_like(scores[0:1])
-
-        # Voting: Weighted average
-        weights = scores[mask] / scores[mask].sum()
-        log_probs = torch.sum(log_probs_filtered * weights.view(-1, 1), dim=0)
-
-        # Apply difficulty coefficient
-        delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
-        value_aware_loss = -torch.mean(delta * log_probs * advantages * values)
+        log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
+        value_aware_loss = -torch.mean(log_probs * advantages * values)
         return value_aware_loss
 
-    def _inner_loop_adaptation(self, batch: 'DataProto') -> dict:
+    def _inner_loop_adaptation(self, batch: DataProto):
         try:
             model_state = ray.get(self.actor_rollout_wg.get_model_state.remote())
         except AttributeError as e:
@@ -363,33 +163,14 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             if self.use_vapo:
                 loss += self._compute_value_aware_loss(batch)
             else:
-                # Generate multiple samples for default loss
-                log_probs_samples = []
-                for _ in range(self.num_samples):
-                    result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
-                    log_probs_samples.append(result["log_probs"])
-
-                log_probs_samples = torch.stack(log_probs_samples, dim=0)
-                scores = self._meta_rm_score(log_probs_samples, batch)
-                mask = scores > 0.5
-                log_probs_filtered = log_probs_samples[mask]
-
-                if log_probs_filtered.numel() == 0:
-                    log_probs_filtered = log_probs_samples.mean(dim=0, keepdim=True)
-                    scores = torch.ones_like(scores[0:1])
-
-                weights = scores[mask] / scores[mask].sum()
-                log_probs = torch.sum(log_probs_filtered * weights.view(-1, 1), dim=0)
-
+                log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
                 advantages = batch.batch["advantages"]
-                delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
-                loss += -torch.mean(delta * log_probs * advantages)
-
+                loss += -torch.mean(log_probs * advantages)
             loss.backward()
             optimizer.step()
 
         return model_state
-    
+
     def _get_worker_parameters(self, worker):
         try:
             params = ray.get(worker.get_model_parameters.remote())
@@ -403,32 +184,6 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         except AttributeError as e:
             raise RuntimeError(f"Worker {worker} does not support set_model_parameters") from e
 
-    def _validate(self):
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("Starting validation")
-        if not hasattr(self, 'val_dataloader') or self.val_dataloader is None:
-            logger.warning("No validation dataloader available, skipping validation")
-            return {}
-
-        if len(self.val_dataset) == 0:
-            logger.warning("Validation dataset is empty, skipping validation")
-            return {}
-
-        try:
-            val_metrics = {}
-            for test_data in self.val_dataloader:
-                if not test_data:
-                    logger.warning("Empty batch in validation dataloader, skipping")
-                    continue
-                # Validation logic (unchanged)
-                # ...
-            logger.info(f"Validation metrics: {val_metrics}")
-            return val_metrics
-        except Exception as e:
-            logger.error(f"Validation failed: {e}")
-            raise 
-    
     def _validate_config(self):
         config = self.config
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes

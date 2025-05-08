@@ -21,6 +21,7 @@ import hydra
 import ray
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.aigcode_c1_trainer import AIGCodeC1Trainer
 from verl.trainer.ppo.reward import load_reward_manager
 
 
@@ -164,16 +165,16 @@ class TaskRunner:
         )
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-
-        trainer = RayPPOTrainer(
-            config=config,
+        class_name = AIGCodeC1Trainer if config.algorithm.use_preference == True else RayPPOTrainer
+        trainer =  class_name(
+            config,
             tokenizer=tokenizer,
             processor=processor,
-            role_worker_mapping=role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
+            role_worker_mapping=role_worker_mapping,
+            ray_worker_group_cls=ray_worker_group_cls,
+            resource_pool_manager=resource_pool_manager,
         )
         trainer.init_workers()
         trainer.fit()

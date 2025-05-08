@@ -1,9 +1,43 @@
+meta_learning:
+  meta_lr: 1e-5
+  inner_lr: 1e-4
+  inner_steps: 5
+  meta_steps: 50
+
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: gae
+  norm_adv_by_std_in_grpo: True
+  use_kl_in_reward: False
+  difficulty_mode: None
+  use_vapo: True
+  use_preference: True
+  type: ppo
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+    
 data:
-  train_batch_size: 256
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
   micro_batch_size_per_gpu: 4  # this is also val batch size
-  train_files: ~/data/gsm8k/train.parquet
-  val_files: ~/data/gsm8k/test.parquet
+  train_files: ['~/data/train.parquet']
+  val_files: ['~/data/test.parquet']
+  cache_dir: '~/.cache/verl/rlhf'
+  max_prompt_length: 1024
+  max_response_length: 1024
+  use_preference: true
+  difficulty_mode: 'k_fold'
+  shuffle: true
+  seed: 1
+  truncation: 'error'
+  train_batch_size: 1024
+  val_batch_size: 1024
+  max_samples: null
+
+  reward_fn_key: data_source
   # Single-turn settings
   prompt_key: question
   response_key: answer

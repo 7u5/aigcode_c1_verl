@@ -20,12 +20,14 @@ import contextlib
 import copy
 import pickle
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Union
+import uuid
+from typing import Any, Dict, Optional, Tuple, Union, List, Callable
 
 import numpy as np
 import pandas as pd
 import tensordict
 import torch
+import ray
 from packaging import version
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
@@ -306,8 +308,105 @@ class DataProto:
                     f"key {key} length {len(val)} is not equal to batch size {batch_size}"
                 )
 
+    def __init__(
+        self,
+        batch: Optional[Dict[str, torch.Tensor]] = None,
+        non_tensor_batch: Optional[Dict[str, Any]] = None,
+        meta_info: Optional[Dict[str, Any]] = None,
+    ):
+        self.batch = batch or {}
+        self.non_tensor_batch = non_tensor_batch or {}
+        self.meta_info = meta_info or {}
+
     @classmethod
-    def from_single_dict(cls, data: Dict[str, Union[torch.Tensor, np.ndarray]], meta_info=None):
+    def from_single_dict(cls, data: Dict[str, Any]) -> 'DataProto':
+        """
+        Create DataProto from a dictionary, handling nested dictionaries from collate_fn.
+        """
+        batch = {}
+        non_tensor_batch = {}
+        meta_info = data.get("meta_info", {})
+
+        # Handle nested dictionaries (e.g., from collate_fn)
+        if "batch" in data and "non_tensor_batch" in data:
+            # Flatten 'batch' (tensor data)
+            for key, val in data["batch"].items():
+                if isinstance(val, torch.Tensor):
+                    batch[key] = val
+                else:
+                    raise ValueError(f"Expected torch.Tensor in batch for key {key}, got {type(val)}")
+            # Flatten 'non_tensor_batch' (non-tensor data)
+            for key, val in data["non_tensor_batch"].items():
+                non_tensor_batch[key] = val
+        else:
+            # Original logic for flat dictionaries
+            for key, val in data.items():
+                if isinstance(val, torch.Tensor):
+                    batch[key] = val
+                elif isinstance(val, (np.ndarray, list, str, int, float, bool)) or val is None:
+                    non_tensor_batch[key] = val
+                else:
+                    raise ValueError(f"Unsupported type in data for key {key}: {type(val)}")
+
+        return cls(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+
+    def repeat(self, repeat_times: int, interleave: bool = False) -> 'DataProto':
+        """
+        Repeat the batch data.
+
+        Args:
+            repeat_times: Number of times to repeat the batch.
+            interleave: If True, interleave the repeated data; otherwise, concatenate.
+
+        Returns:
+            A new DataProto with repeated data.
+        """
+        if repeat_times <= 0:
+            raise ValueError(f"repeat_times must be positive, got {repeat_times}")
+
+        new_batch = {}
+        new_non_tensor_batch = {}
+        new_meta_info = copy.deepcopy(self.meta_info)
+
+        # Handle dictionary-based batch
+        if isinstance(self.batch, dict):
+            for key, val in self.batch.items():
+                if not isinstance(val, torch.Tensor):
+                    raise ValueError(f"Expected torch.Tensor for key {key}, got {type(val)}")
+                if interleave:
+                    # Interleave: [x1, x2] -> [x1, x1, x2, x2]
+                    val = val.unsqueeze(1).repeat(1, repeat_times).view(-1, *val.shape[1:])
+                else:
+                    # Concatenate: [x1, x2] -> [x1, x2, x1, x2]
+                    val = val.repeat(repeat_times, *[1 for _ in val.shape[1:]])
+                new_batch[key] = val
+            # Infer batch_size from the first tensor
+            batch_size = next(iter(self.batch.values())).shape[0] * repeat_times
+        else:
+            # Original logic for Batch objects (if used elsewhere)
+            batch_size = (self.batch.batch_size[0] * repeat_times,)
+            new_batch = self.batch.repeat(repeat_times=repeat_times, interleave=interleave)
+
+        # Repeat non_tensor_batch
+        for key, val in self.non_tensor_batch.items():
+            if isinstance(val, np.ndarray):
+                if interleave:
+                    val = np.repeat(val[:, np.newaxis], repeat_times, axis=1).flatten()
+                else:
+                    val = np.tile(val, repeat_times)
+            elif isinstance(val, list):
+                if interleave:
+                    val = [x for x in val for _ in range(repeat_times)]
+                else:
+                    val = val * repeat_times
+            else:
+                val = [val] * batch_size
+            new_non_tensor_batch[key] = val
+
+        return DataProto(batch=new_batch, non_tensor_batch=new_non_tensor_batch, meta_info=new_meta_info)
+
+    @classmethod
+    def from_single_dict_bak(cls, data: Dict[str, Union[torch.Tensor, np.ndarray]], meta_info=None):
         tensors = {}
         non_tensors = {}
 
@@ -664,7 +763,7 @@ class DataProto:
         self.batch = self.batch[indices]
         self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
 
-    def repeat(self, repeat_times=2, interleave=True):
+    def repeat_bak(self, repeat_times=2, interleave=True):
         """
         Repeat the batch data a specified number of times.
 
@@ -707,10 +806,6 @@ class DataProto:
             non_tensor_batch=repeated_non_tensor_batch,
             meta_info=self.meta_info,
         )
-
-
-import ray
-
 
 @dataclass
 class DataProtoFuture:
@@ -758,7 +853,19 @@ class DataProtoFuture:
         if self.dispatch_fn is not None:
             output = self.dispatch_fn(output)  # split in batch dim, select using dp
         return output
-
+    
+    def split_pairs(self):
+        if "positive" not in self.batch or "negative" not in self.batch:
+            raise ValueError("Batch does not contain positive and negative pairs for DAPO.")
+        pos_batch = DataProto(
+            batch={k: v for k, v in self.batch.items() if k.startswith("positive_")},
+            non_tensor_batch=self.non_tensor_batch
+        )
+        neg_batch = DataProto(
+            batch={k: v for k, v in self.batch.items() if k.startswith("negative_")},
+            non_tensor_batch=self.non_tensor_batch
+        )
+        return pos_batch, neg_batch
 
 import torch.distributed
 

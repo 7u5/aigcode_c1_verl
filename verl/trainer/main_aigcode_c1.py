@@ -32,8 +32,6 @@ def main(config):
     wandb.init(project=config.trainer.project_name, name=config.trainer.experiment_name)
     run_aigcode_c1(config)
     exit()
-    os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-    os.environ.setdefault('MASTER_PORT', '29501')
     num_gpus=config.trainer.n_gpus_per_node * config.trainer.nnodes
     os.environ.setdefault('WORLD_SIZE', str(num_gpus))
     os.environ.setdefault('RANK', "0")

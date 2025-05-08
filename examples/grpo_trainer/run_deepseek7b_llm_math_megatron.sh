@@ -81,6 +81,9 @@ math_test_path=$HOME/data/math/test.parquet
 #test_files="['$gsm8k_test_path', '$math_test_path']"
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
+
+
+
 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_megatron_trainer.yaml'\
     algorithm.adv_estimator=grpo \
@@ -98,7 +101,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$PP \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.5 \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -114,7 +117,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_aigcode_c1' \
-    trainer.experiment_name='deepseek_llm_7b_math_c1_megatron' \
+    trainer.experiment_name='deepseek_llm_7b_math_grpo_baseline' \
     trainer.n_gpus_per_node=$NUM_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

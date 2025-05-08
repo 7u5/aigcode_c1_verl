@@ -109,6 +109,238 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+def compute_meta_rm_scores(
+    log_probs_samples: torch.Tensor,
+    response_mask: torch.Tensor,
+    difficulty_coeff: torch.Tensor = None,
+    agent_performance: torch.Tensor = None,
+    curriculum_progress: float = 0.5,
+    mode: str = "variance",
+):
+    """Compute meta-RM scores with curriculum progress adjustment."""
+    with torch.no_grad():
+        if mode == "variance":
+            masked_log_probs = log_probs_samples * response_mask.unsqueeze(0)
+            variance = torch.var(masked_log_probs, dim=-1, keepdim=True).squeeze(-1)
+            scores = 1.0 / (1.0 + variance)
+        elif mode == "entropy":
+            probs = torch.softmax(log_probs_samples, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+            entropy = (entropy * response_mask.unsqueeze(0)).sum(-1) / response_mask.sum(-1).unsqueeze(0)
+            scores = 1.0 / (1.0 + entropy)
+        
+        # Adjust scores based on curriculum progress
+        if agent_performance is not None:
+            performance_factor = torch.sigmoid(agent_performance)
+            scores = scores * (1 - curriculum_progress + curriculum_progress * performance_factor)
+        
+        if difficulty_coeff is not None:
+            scores = scores * difficulty_coeff.view(1, -1)
+        
+        scores = torch.clamp(scores, 0.0, 1.0)
+    return scores
+
+def hierarchical_multi_gate_weights(
+    scores: torch.Tensor,
+    difficulty_coeff: torch.Tensor = None,
+    curriculum_progress: float = 0.5,
+    gate_factors: list = None,
+    gate_weights: list = None,
+):
+    """Compute hierarchical multi-gate weights with curriculum progress."""
+    if gate_factors is None:
+        gate_factors = ["score", "difficulty", "progress"]
+        gate_weights = [1.0, 0.5, 0.3]
+    
+    weights = torch.ones_like(scores)
+    for factor, weight in zip(gate_factors, gate_weights):
+        if factor == "score":
+            weights = weights * scores ** weight
+        elif factor == "difficulty" and difficulty_coeff is not None:
+            weights = weights * (difficulty_coeff.view(1, -1) ** weight)
+        elif factor == "progress":
+            weights = weights * (1.0 + curriculum_progress) ** weight
+    
+    weights = weights / (weights.sum(dim=0, keepdim=True) + 1e-8)
+    return weights
+
+def generate_curriculum(
+    task_pool: list,
+    agent_performance: torch.Tensor,
+    difficulty_coeffs: torch.Tensor,
+    mode: str = "zpd",
+    task_correlations: torch.Tensor = None,
+) -> list:
+    """Generate a curriculum of tasks based on agent performance and difficulty.
+    
+    Args:
+        task_pool: (list) List of tasks (e.g., task IDs or configurations)
+        agent_performance: (torch.Tensor) Shape: (num_tasks,) Agent's performance on each task
+        difficulty_coeffs: (torch.Tensor) Shape: (num_tasks,) Difficulty coefficient for each task
+        mode: (str) Curriculum generation mode ("zpd", "correlation")
+        task_correlations: (torch.Tensor) Shape: (num_tasks, num_tasks) Task correlation matrix
+    
+    Returns:
+        curriculum: (list) Ordered list of task indices
+    """
+    if mode == "zpd":
+        # Select tasks where difficulty is slightly above current performance
+        performance_threshold = agent_performance.mean() + agent_performance.std()
+        valid_tasks = [
+            i for i, diff in enumerate(difficulty_coeffs)
+            if performance_threshold * 0.8 <= diff <= performance_threshold * 1.2
+        ]
+        curriculum = sorted(valid_tasks, key=lambda i: difficulty_coeffs[i])
+    
+    elif mode == "correlation" and task_correlations is not None:
+        # Select tasks with high correlation to well-performing tasks
+        well_performed = torch.topk(agent_performance, k=len(task_pool) // 2).indices
+        correlation_scores = task_correlations[well_performed].mean(0)
+        curriculum = torch.argsort(correlation_scores * difficulty_coeffs).tolist()
+    
+    else:
+        raise ValueError(f"Invalid curriculum mode: {mode}")
+    
+    return [task_pool[i] for i in curriculum]
+
+
+def distributed_compute_difficulty_coeff(
+    log_probs: torch.Tensor,
+    values: torch.Tensor,
+    rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    task_features: dict = None,
+    k_fold: int = 5,
+    mode: str = "k_fold",
+    dist_group=None,
+):
+    """Distributed version of compute_difficulty_coeff."""
+    difficulty_coeff = compute_difficulty_coeff(
+        log_probs, values, rewards, response_mask, task_features, k_fold, mode
+    )
+    
+    if dist_group is not None and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(difficulty_coeff, op=torch.distributed.ReduceOp.SUM, group=dist_group)
+        difficulty_coeff /= torch.distributed.get_world_size(dist_group)
+    
+    return difficulty_coeff
+
+def compute_difficulty_coeff(
+    log_probs: torch.Tensor,
+    values: torch.Tensor,
+    rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    task_features: dict = None,
+    k_fold: int = 5,
+    mode: str = "k_fold",
+) -> torch.Tensor:
+    """Compute dynamic difficulty coefficient based on agent performance or task features.
+    
+    Args:
+        log_probs: (torch.Tensor) Shape: (batch_size, seq_len)
+        values: (torch.Tensor) Shape: (batch_size, seq_len)
+        rewards: (torch.Tensor) Shape: (batch_size, seq_len)
+        response_mask: (torch.Tensor) Shape: (batch_size, seq_len)
+        task_features: (dict) Task-specific features (e.g., seq_length, reward_sparsity)
+        k_fold: (int) Number of folds for K-Fold cross-validation
+        mode: (str) Difficulty computation mode ("k_fold", "zpd", "feature_based")
+    
+    Returns:
+        difficulty_coeff: (torch.Tensor) Shape: (batch_size,)
+    """
+    with torch.no_grad():
+        if mode == "k_fold":
+            # Split samples into K folds
+            batch_size = log_probs.shape[0]
+            fold_size = batch_size // k_fold
+            difficulty_scores = torch.zeros(batch_size, device=log_probs.device)
+            
+            for k in range(k_fold):
+                # Train teacher model on K-1 folds
+                train_indices = list(range(0, k * fold_size)) + list(range((k + 1) * fold_size, batch_size))
+                test_indices = list(range(k * fold_size, (k + 1) * fold_size))
+                
+                # Simulate teacher model evaluation (replace with actual model training)
+                teacher_loss = torch.mean((log_probs[test_indices] - log_probs[train_indices].mean(0)) ** 2, dim=-1)
+                difficulty_scores[test_indices] = teacher_loss
+            
+            # Normalize to [0, 1]
+            difficulty_coeff = (difficulty_scores - difficulty_scores.min()) / (
+                difficulty_scores.max() - difficulty_scores.min() + 1e-8
+            )
+        
+        elif mode == "zpd":
+            # Compute performance metric (e.g., value error)
+            value_error = torch.mean((values - rewards) ** 2 * response_mask, dim=-1)
+            # Map to difficulty_coeff: higher error -> higher difficulty
+            difficulty_coeff = torch.sigmoid(value_error)
+        
+        elif mode == "feature_based" and task_features:
+            # Example: linear combination of sequence length and reward sparsity
+            seq_length = torch.tensor(task_features.get("seq_length", 1.0), device=log_probs.device)
+            reward_sparsity = torch.tensor(task_features.get("reward_sparsity", 1.0), device=log_probs.device)
+            difficulty_coeff = 0.5 * seq_length / seq_length.max() + 0.5 * reward_sparsity
+            difficulty_coeff = torch.clamp(difficulty_coeff, 0.0, 1.0)
+        
+        else:
+            raise ValueError(f"Invalid difficulty mode: {mode}")
+    
+    return difficulty_coeff
+
+
+def compute_weighted_log_probs(
+    log_probs_samples: torch.Tensor,
+    response_mask: torch.Tensor,
+    difficulty_coeff: torch.Tensor = None,
+    meta_rm_mode: str = "variance",
+    threshold: float = 0.5,
+    use_hierarchical_gating: bool = False,
+    gate_factors: list = None,
+    gate_weights: list = None,
+):
+    """Compute weighted average of log-prob samples using meta-RM scores and optional hierarchical gating.
+    
+    Args:
+        log_probs_samples: (torch.Tensor) Shape: (num_samples, batch_size, seq_len)
+        response_mask: (torch.Tensor) Shape: (batch_size, seq_len)
+        difficulty_coeff: (torch.Tensor) Shape: (batch_size,) or None
+        meta_rm_mode: (str) Meta-RM scoring mode ("variance" or "entropy")
+        threshold: (float) Score threshold for filtering samples
+        use_hierarchical_gating: (bool) Whether to use HoME-inspired hierarchical gating
+        gate_factors: (list) Factors for hierarchical gating
+        gate_weights: (list) Weights for gating factors
+    
+    Returns:
+        log_probs: (torch.Tensor) Shape: (batch_size, seq_len)
+    """
+    # Compute meta-RM scores
+    scores = compute_meta_rm_scores(
+        log_probs_samples, response_mask, difficulty_coeff, mode=meta_rm_mode
+    )
+
+    # Filter samples with scores above threshold
+    mask = scores > threshold
+    filtered_log_probs = log_probs_samples[mask]
+
+    # Fallback to mean if no samples pass
+    if filtered_log_probs.numel() == 0:
+        filtered_log_probs = log_probs_samples.mean(dim=0, keepdim=True)
+        filtered_scores = torch.ones_like(scores[0:1])
+    else:
+        filtered_scores = scores[mask]
+
+    # Compute weights
+    if use_hierarchical_gating:
+        weights = hierarchical_multi_gate_weights(
+            filtered_scores, difficulty_coeff, gate_factors, gate_weights
+        )
+    else:
+        weights = filtered_scores / (filtered_scores.sum(dim=0, keepdim=True) + 1e-8)
+
+    # Weighted average of log-probs
+    log_probs = torch.sum(filtered_log_probs * weights.view(-1, 1, 1), dim=0)
+    return log_probs
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -485,7 +717,7 @@ def compute_value_loss(vpreds, returns, values, response_mask, cliprange_value):
     return vf_loss, vf_clipfrac
 
 
-def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty: str, difficulty_coeff: torch.Tensor = None) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob.
     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
 
@@ -516,5 +748,7 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     if kl_penalty == "full":
         # so, here logprob and ref_logprob should contain the logits for every token in vocabulary
         raise NotImplementedError
-
-    raise NotImplementedError
+    if difficulty_coeff is not None:
+        penalty = penalty * difficulty_coeff.unsqueeze(-1)
+    return penalty   
+    #raise NotImplementedError

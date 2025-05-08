@@ -26,13 +26,7 @@ fi
 DTYPE="bfloat16"
 # Validate dataset paths
 HOME=/home/aigc
-DATA_DIR="$HOME/data/gsm8k"
-TRAIN_FILE="$DATA_DIR/train.parquet"
-VAL_FILE="$DATA_DIR/test.parquet"
-if [ ! -f "$TRAIN_FILE" ] || [ ! -f "$VAL_FILE" ]; then
-  echo "Error: Dataset files not found at $DATA_DIR"
-  exit 1
-fi
+
 MODEL_PATH="deepseek-ai/deepseek-llm-7b-chat"
 
 # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
@@ -59,7 +53,8 @@ gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files=$gsm8k_train_path
 test_files=$gsm8k_test_path
-
+root=/sharedata
+hfpath=$root/hf
 NODES=$NUM_GPUS
 PP=2
 TP=$TENSOR_PARALLEL
@@ -70,17 +65,40 @@ VLLM_TP=$TENSOR_PARALLEL
 HYDRA_FULL_ERROR=1
 # Validate model path
 #    trainer.default_local_dir=$DIST_CKPT_PATH \
-export PYTHONPATH=/sharedata/qiuwu/aigcode_c1:$PYTHONPATH
+export PYTHONPATH=/sharedata/qiuwu/aigcode_c1_verl:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
+export EXP_NAME="deepseek_7b_megatron_test"
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 math_train_path=$HOME/data/math/train.parquet
 math_test_path=$HOME/data/math/test.parquet
 #train_files="['$gsm8k_train_path', '$math_train_path']"
 #test_files="['$gsm8k_test_path', '$math_test_path']"
+train_path=BytedTsinghua-SIA/DAPO-Math-17k
+train_dir=$(echo "$train_path" | tr '/' '_')
+train_name=$(echo "${train_path#*/}" | tr '[A-Z]' '[a-z]')
+test_path=BytedTsinghua-SIA/AIME-2024
+test_dir=$(echo "$test_path" | tr '/' '_')
+test_name=$(echo "${test_path#*/}" | tr '[A-Z]' '[a-z]')
+RAY_DATA_HOME=$HOME
+TRAIN_FILE=${hfpath}/${train_dir}/data/${train_name}.parquet
+TEST_FILE=${hfpath}/${test_dir}/data/${test_name}.parquet
+
+
+VAL_FILE=$TEST_FILE
+if [ ! -f "$TRAIN_FILE" ] || [ ! -f "$VAL_FILE" ]; then
+  echo "Error: Dataset files not found at $hfpath"
+  exit 1
+fi
+
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
+
+train_files="['$TRAIN_FILE']"
+test_files="['$TEST_FILE']"
+
+difficulty_mode="k_fold"
 config_file=""
 #    --config-name='ppo_megatron_trainer.yaml'\
 python3 -m verl.trainer.main_aigcode_c1 --config-path=config \
@@ -91,6 +109,7 @@ python3 -m verl.trainer.main_aigcode_c1 --config-path=config \
     data.train_batch_size=1024 \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
+    data.max_samples=None \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path=$MODEL_PATH \
@@ -113,10 +132,14 @@ python3 -m verl.trainer.main_aigcode_c1 --config-path=config \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=$PP \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=$TP \
     algorithm.use_kl_in_reward=False \
+    algorithm.use_preference=True \
+    algorithm.difficulty_mode=${difficulty_mode} \
+    data.difficulty_mode=${difficulty_mode} \
+    reward_model.model.path=null \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_aigcode_c1' \
-    trainer.experiment_name='deepseek_llm_7b_math_megatron' \
+    trainer.experiment_name=$EXP_NAME \
     trainer.n_gpus_per_node=$NUM_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
