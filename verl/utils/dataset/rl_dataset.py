@@ -35,75 +35,55 @@ from transformers import PreTrainedTokenizer
 from datasets import load_dataset
 
 #from verl.utils.text.tokenizer import load_tokenizer
-
-def collate_fn(batch):
-    import torch
-    import logging
+def collate_fn(data_list: List[Dict]) -> Dict:
+    """Collate function for RLHFDataset with robust handling of empty/invalid tensors."""
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(handler)
 
-    logger.info(f"Collating batch of size {len(batch)}")
-    if not batch:
+    logger.info(f"Collating batch of size {len(data_list)}")
+    if not data_list:
         logger.error("Empty batch received in collate_fn")
-        return {}
+        return {"batch": {}, "non_tensor_batch": {}, "meta_info": {}}
 
-    tensors = {}
-    try:
-        required_keys = ['input_ids', 'attention_mask']  # Adjust based on expected keys
-        if not all(key in batch[0] for key in required_keys):
-            logger.error(f"Batch missing required keys: {required_keys}")
-            return {}
-
-        for key in batch[0].keys():
-            val = [item[key] for item in batch if key in item and item[key] is not None]
-            if not val:
-                logger.warning(f"No valid data for key {key} in batch")
-                continue
-            if isinstance(val[0], torch.Tensor):
-                # Check for empty tensors
-                val = [v for v in val if v.numel() > 0]
-                if not val:
-                    logger.warning(f"All tensors for key {key} are empty")
-                    continue
-                try:
-                    tensors[key] = torch.nn.utils.rnn.pad_sequence(val, batch_first=True, padding_value=0)
-                except Exception as e:
-                    logger.error(f"Failed to pad sequence for key {key}: {e}")
-                    continue
-            else:
-                tensors[key] = val
-        if not tensors:
-            logger.error("No valid tensors in batch after processing")
-            return {}
-        logger.info(f"Collated batch keys: {list(tensors.keys())}")
-        return tensors
-    except Exception as e:
-        logger.error(f"Failed to collate batch: {e}")
-        return {}
-    
-def collate_fn_bak(data_list: List[Dict]) -> Dict:
-    """Collate function for RLHFDataset."""
     tensors = defaultdict(list)
     non_tensors = defaultdict(list)
 
-    for data in data_list:
+    required_keys = ['input_ids', 'attention_mask']
+    valid_samples = 0
+    for idx, data in enumerate(data_list):
+        if not all(key in data for key in required_keys):
+            logger.warning(f"Skipping sample {idx} missing required keys: {required_keys}, sample: {data}")
+            continue
+        if any(data[key].numel() == 0 for key in required_keys if isinstance(data[key], torch.Tensor)):
+            logger.warning(f"Skipping sample {idx} with empty tensor for keys: {required_keys}, sample: {data}")
+            continue
+        valid_samples += 1
         for key, val in data.items():
-            if isinstance(val, torch.Tensor):
+            if isinstance(val, torch.Tensor) and val.numel() > 0:
                 tensors[key].append(val)
             else:
                 non_tensors[key].append(val)
 
+    processed_tensors = {}
     for key, val in tensors.items():
-        tensors[key] = torch.nn.utils.rnn.pad_sequence(val, batch_first=True, padding_value=0)
+        if not val:
+            logger.warning(f"No valid tensors for key {key}")
+            continue
+        try:
+            processed_tensors[key] = torch.nn.utils.rnn.pad_sequence(val, batch_first=True, padding_value=0)
+        except Exception as e:
+            logger.error(f"Failed to pad sequence for key {key}: {e}")
+            continue
 
     for key, val in non_tensors.items():
         non_tensors[key] = np.array(val, dtype=object)
 
-    return {"batch": dict(tensors), "non_tensor_batch": dict(non_tensors), "meta_info": {}}
+    if not processed_tensors:
+        logger.error(f"No valid tensors after collation. Valid samples: {valid_samples}/{len(data_list)}. Check dataset for missing or invalid prompt/reward_model fields.")
+        raise ValueError("No valid tensors in batch. Ensure all samples have valid prompt and ground_truth fields.")
 
+    logger.info(f"Collated batch keys: {list(processed_tensors.keys())}, valid samples: {valid_samples}/{len(data_list)}")
+    return {"batch": dict(processed_tensors), "non_tensor_batch": dict(non_tensors), "meta_info": {}}
 
 class PreferencePairDataset(datasets.Dataset):
     """Dataset class for generating preference pairs from Parquet files or Hugging Face datasets."""
@@ -215,9 +195,10 @@ class PreferencePairDataset(datasets.Dataset):
         try:
             if self.is_chatbot_arena:
                 self._preprocess_chatbot_arena()
-            elif self.data_files and "positive_response" in self.dataset.column_names:
-                self._preprocess_parquet_with_pairs()
+            #elif self.data_files and "positive_response" in self.dataset.column_names:
+            #    self._preprocess_parquet_with_pairs()
             else:
+                self.logger.info(f"Preprocessing math dataset")
                 self._preprocess_math_dataset()
             self.logger.info(f"Preprocessing complete. Generated {len(self.pairs)} pairs")
             if len(self.pairs) == 0:
@@ -328,8 +309,8 @@ class PreferencePairDataset(datasets.Dataset):
                 )
 
             self.pairs.append({
-                "prompt": prompt_inputs["input_ids"].squeeze(0),
-                "prompt_mask": prompt_inputs["attention_mask"].squeeze(0),
+                "input_ids": prompt_inputs["input_ids"].squeeze(0),
+                "attention_mask": prompt_inputs["attention_mask"].squeeze(0),
                 "pos_response": pos_inputs["input_ids"].squeeze(0),
                 "neg_response": neg_inputs["input_ids"].squeeze(0),
                 "pos_mask": pos_mask,
@@ -376,8 +357,8 @@ class RLHFDataset(Dataset):
         max_length: int = 1024,
         difficulty_mode: str = "k_fold",
     ):
-        if (data_files is None and dataset_name is None) or (data_files is not None and dataset_name is not None):
-            raise ValueError("Exactly one of data_files or dataset_name must be provided.")
+        #if (data_files is None and dataset_name is None) or (data_files is not None and dataset_name is not None):
+        #    raise ValueError("Exactly one of data_files or dataset_name must be provided.")
 
         #self.data = datasets.Dataset.from_list([])
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -408,25 +389,6 @@ class RLHFDataset(Dataset):
 
 
         try:
-            '''
-            # Verify file access
-            for file in self.data_files:
-                if not os.path.exists(file):
-                    self.logger.error(f"File not found: {file}")
-                    raise FileNotFoundError(f"File not found: {file}")
-                if isinstance(data_files, str):
-                    print(f"Loading file: {file}")
-                    df = pd.read_parquet(file)
-                    print(f"Raw data size for {file}: {len(df)}")
-                    self.data.append(df)
-            self.data = pd.concat(self.data, ignore_index=True) if self.data else pd.DataFrame()
-            # Validate data
-            if len(self.data) == 0:
-                print("Warning: Dataset is empty after preprocessing")
-            else:
-                print(f"Sample data: {self.data.head()}")
-            print(f"Total raw data size: {len(self.data)}")
-            '''
             if self.use_preference:
                 self.logger.info("Using PreferencePairDataset")
                 self.data = PreferencePairDataset(
@@ -555,7 +517,13 @@ class RLHFDataset(Dataset):
     
     def __getitem__(self, item):
         if self.use_preference:
-            return self.data[item]
+            #return self.data[item]
+            result = self.data[item]
+            if isinstance(result, dict):
+                for key in ['input_ids', 'attention_mask']:
+                    if key in result and isinstance(result[key], torch.Tensor) and result[key].numel() == 0:
+                        self.logger.error(f"Empty tensor for key {key} in item {item}")
+            return result
         row_dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}

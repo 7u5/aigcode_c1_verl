@@ -49,10 +49,6 @@ fi
 python scripts/converter_hf_to_mcore.py --hf_model_path $MODEL_PATH --output_path $DIST_CKPT_PATH
 
 # 2. run the script
-gsm8k_train_path=$HOME/data/gsm8k/train.parquet
-gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-train_files=$gsm8k_train_path
-test_files=$gsm8k_test_path
 root=/sharedata
 hfpath=$root/hf
 NODES=$NUM_GPUS
@@ -69,10 +65,10 @@ export PYTHONPATH=/sharedata/qiuwu/aigcode_c1_verl:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
 export EXP_NAME="deepseek_7b_megatron_test"
-gsm8k_train_path=$HOME/data/gsm8k/train.parquet
-gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
+#gsm8k_train_path=$HOME/data/gsm8k/train.parquet
+#gsm8k_test_path=$HOME/data/gsm8k/test.parquet
+#math_train_path=$HOME/data/math/train.parquet
+#math_test_path=$HOME/data/math/test.parquet
 #train_files="['$gsm8k_train_path', '$math_train_path']"
 #test_files="['$gsm8k_test_path', '$math_test_path']"
 train_path=BytedTsinghua-SIA/DAPO-Math-17k
@@ -92,14 +88,13 @@ if [ ! -f "$TRAIN_FILE" ] || [ ! -f "$VAL_FILE" ]; then
   exit 1
 fi
 
-train_files="['$gsm8k_train_path']"
-test_files="['$gsm8k_test_path']"
+#train_files="['$gsm8k_train_path']"
+#test_files="['$gsm8k_test_path']"
 
 train_files="['$TRAIN_FILE']"
 test_files="['$TEST_FILE']"
 
 difficulty_mode="k_fold"
-config_file=""
 #    --config-name='ppo_megatron_trainer.yaml'\
 python3 -m verl.trainer.main_aigcode_c1 --config-path=config \
     --config-name='aigcode_c1_megatron_trainer.yaml'\

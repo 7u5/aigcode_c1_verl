@@ -15,10 +15,12 @@
 import copy
 import os
 import re
+import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import datasets
+from datasets import load_dataset
 import numpy as np
 import torch
 from omegaconf import DictConfig, ListConfig
@@ -158,9 +160,10 @@ def collate_fn(data_list: List[Dict]) -> Dict:
                 non_tensors[key].append(val)
 
     for key, val in tensors.items():
-        if len(val) == 0:
+        try:
+            tensors[key] = torch.nn.utils.rnn.pad_sequence(val, batch_first=True, padding_value=0)
+        except:
             raise ValueError(f"Empty data found for key: {key}")
-        tensors[key] = torch.nn.utils.rnn.pad_sequence(val, batch_first=True, padding_value=0)
 
     for key, val in non_tensors.items():
         non_tensors[key] = np.array(val, dtype=object)
@@ -181,6 +184,7 @@ class PreferencePairDataset(Dataset):
         mode: str = "k_fold",
         processor: Optional[ProcessorMixin] = None,
         config: Optional[DictConfig] = None,
+        max_samples: Optional[int] = None,
     ):
         """
         Initialize PreferencePairDataset.
@@ -196,6 +200,8 @@ class PreferencePairDataset(Dataset):
             processor: Optional processor for multi-modal data.
             config: Configuration object with dataset settings.
         """
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
         if (data_files is None and dataset_name is None) or (data_files is not None and dataset_name is not None):
             raise ValueError("Exactly one of data_files or dataset_name must be provided.")
 
@@ -210,6 +216,7 @@ class PreferencePairDataset(Dataset):
         self.processor = processor
         self.config = config or {}
         self.cache_dir = os.path.expanduser(cache_dir)
+        self.max_samples = max_samples
         self.pairs = []
         self.task_features = []
         self.difficulty_coeffs = []
@@ -221,15 +228,25 @@ class PreferencePairDataset(Dataset):
 
     def _load_data(self):
         """Load data from Parquet files or Hugging Face dataset."""
-        if self.data_files:
-            dataframes = []
-            for file in self.data_files:
-                file = os.path.expanduser(file)
-                dataframe = datasets.load_dataset("parquet", data_files=file, cache_dir=self.cache_dir)["train"]
-                dataframes.append(dataframe)
-            self.dataset = datasets.concatenate_datasets(dataframes)
-        else:
-            self.dataset = datasets.load_dataset(self.dataset_name, cache_dir=self.cache_dir)["train"]
+        self.logger.info(f"Loading data from {self.data_files or self.dataset_name}")
+        try:
+            if self.data_files:
+                dataframes = []
+                for file in self.data_files:
+                    file = os.path.expanduser(file)
+                    self.logger.info(f"Loading Parquet file: {file}")
+                    dataframe = load_dataset("parquet", data_files=file, cache_dir=self.cache_dir, split="train")
+                    dataframes.append(dataframe)
+                self.dataset = datasets.concatenate_datasets(dataframes)
+            else:
+                self.dataset = load_dataset(self.dataset_name, cache_dir=self.cache_dir, split="train")
+            if self.max_samples:
+                self.logger.info(f"Limiting dataset to {self.max_samples} samples")
+                self.dataset = self.dataset.select(range(min(self.max_samples, len(self.dataset))))
+            self.logger.info(f"Loaded dataset with {len(self.dataset)} rows")
+        except Exception as e:
+            self.logger.error(f"Failed to load dataset: {e}")
+            raise
 
     def compute_reward(self, text: str) -> float:
         """Compute reward score for a given text using the reward model."""
@@ -242,12 +259,20 @@ class PreferencePairDataset(Dataset):
 
     def _preprocess(self):
         """Preprocess dataset to create preference pairs."""
-        if self.is_chatbot_arena:
-            self._preprocess_chatbot_arena()
-        elif self.data_files and "positive_response" in self.dataset.column_names:
-            self._preprocess_parquet_with_pairs()
-        else:
-            self._preprocess_generic()
+        self.logger.info("Starting preprocessing")
+        try:
+            if self.is_chatbot_arena:
+                self._preprocess_chatbot_arena()
+            elif self.data_files and "positive_response" in self.dataset.column_names:
+                self._preprocess_parquet_with_pairs()
+            else:
+                self._preprocess_math_dataset()
+            self.logger.info(f"Preprocessing complete. Generated {len(self.pairs)} pairs")
+            if len(self.pairs) == 0:
+                self.logger.error("No pairs generated. Check dataset schema or preprocessing logic.")
+        except Exception as e:
+            self.logger.error(f"Preprocessing failed: {e}")
+            raise
 
     def _preprocess_parquet_with_pairs(self):
         """Preprocess Parquet dataset with explicit positive/negative response columns."""
@@ -273,24 +298,70 @@ class PreferencePairDataset(Dataset):
             neg_response = response_b if preference == "model_a" else response_a
             self._process_pair(prompt, pos_response, neg_response, sample.get("index", 0)) 
 
-    def _preprocess_generic(self):
-        """Preprocess generic dataset by grouping responses and scoring with reward model."""
-        prompt_to_responses = defaultdict(list)
-        for sample in self.dataset:
-            prompt = sample[self.prompt_key]
-            response = sample.get("response", "")
-            if not response:
-                continue
-            prompt_to_responses[prompt].append((response, sample.get("index", 0)))
+    def _generate_negative_response(self, positive_response: str) -> str:
+        """Generate a synthetic negative response by perturbing the positive response."""
+        self.logger.debug(f"Generating negative response for: {positive_response}")
+        try:
+            match = re.search(r"Answer: \$([^$]+)", positive_response)
+            if match:
+                correct_answer = match.group(1).strip()
+                if '/' in correct_answer:
+                    try:
+                        num, denom = map(int, correct_answer.split('/'))
+                        incorrect_answer = f"{num+1}/{denom}"
+                    except:
+                        incorrect_answer = f"{correct_answer}_incorrect"
+                else:
+                    try:
+                        correct_num = float(correct_answer)
+                        incorrect_answer = str(correct_num + 1 if correct_num < 100 else correct_num - 1)
+                    except:
+                        incorrect_answer = f"{correct_answer}_incorrect"
+                negative_response = positive_response.replace(
+                    f"Answer: ${correct_answer}", f"Answer: ${incorrect_answer}"
+                )
+                return negative_response
+        except Exception as e:
+            self.logger.warning(f"Failed to parse answer: {e}")
+        return positive_response + "\nThis answer is incorrect."
 
-        for prompt, responses in prompt_to_responses.items():
-            if len(responses) < 2:
+    def _preprocess_math_dataset(self):
+        """Preprocess math dataset with single ground truth answer per prompt."""
+        self.logger.info("Processing math dataset")
+        skipped_samples = {"invalid_prompt": 0, "empty_prompt": 0, "missing_ground_truth": 0, "other": 0}
+        processed_samples = 0
+        for i, sample in enumerate(self.dataset):
+            if i % 1000 == 0:
+                self.logger.info(f"Processed {i} samples, generated {len(self.pairs)} pairs, skipped {skipped_samples}")
+            try:
+                prompt = sample[self.prompt_key]
+                if not isinstance(prompt, list) or not prompt:
+                    self.logger.debug(f"Skipping sample {i}: Invalid prompt {prompt}")
+                    skipped_samples["invalid_prompt"] += 1
+                    continue
+                prompt_text = prompt[0]["content"] if prompt[0].get("role") == "user" else ""
+                if not prompt_text:
+                    self.logger.debug(f"Skipping sample {i}: Empty prompt text")
+                    skipped_samples["empty_prompt"] += 1
+                    continue
+                reward_model = sample.get("reward_model", {})
+                ground_truth = reward_model.get("ground_truth", "")
+                if not ground_truth:
+                    self.logger.debug(f"Skipping sample {i}: Missing ground truth")
+                    skipped_samples["missing_ground_truth"] += 1
+                    continue
+                pos_response = f"Answer: ${ground_truth}"
+                neg_response = self._generate_negative_response(pos_response)
+                index = sample.get("extra_info", {}).get("index", i)
+                self._process_pair(prompt_text, pos_response, neg_response, index)
+                processed_samples += 1
+            except Exception as e:
+                self.logger.warning(f"Error processing sample {i}: {e}")
+                skipped_samples["other"] += 1
                 continue
-            response_rewards = [(resp, idx, self.compute_reward(resp)) for resp, idx in responses]
-            response_rewards.sort(key=lambda x: x[2], reverse=True)
-            pos_response, pos_idx, _ = response_rewards[0]
-            neg_response, neg_idx, _ = response_rewards[-1]
-            self._process_pair(prompt, pos_response, neg_response, pos_idx)
+        self.logger.info(f"Finished processing. Total samples: {i+1}, Processed: {processed_samples}, Skipped: {skipped_samples}, Pairs: {len(self.pairs)}")
+        if len(self.pairs) == 0:
+            self.logger.error("No pairs generated. Dataset may have inconsistent schema or all samples were skipped.")
 
     def _process_pair(self, prompt: str, pos_response: str, neg_response: str, index: int):
         """Tokenize and compute difficulty coefficient for a preference pair."""
@@ -374,6 +445,10 @@ class RLHFDataset(Dataset):
     ):
         data_files = None if isinstance(data_files, ListConfig) and len(data_files) == 0 else data_files
         dataset_name = None if dataset_name == '' else dataset_name
+        print("*****************************")
+        print(f"data_files: {data_files}({type(data_files)})")
+        print(f"dataset_name: {dataset_name}({type(dataset_name)})")
+        print("*****************************")
         if (data_files is None and dataset_name is None) or (data_files is not None and dataset_name is not None):
             raise ValueError("Exactly one of data_files or dataset_name must be provided.")
 

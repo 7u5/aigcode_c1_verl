@@ -133,6 +133,7 @@ class ActorRolloutRefWorker(MegatronWorker):
                 self.config.ref.ppo_micro_batch_size_per_gpu = self.config.ref.ppo_micro_batch_size
             self._is_offload_param = self.config.ref.get("param_offload", False)
 
+    
     def _build_model_optimizer(self, model_path, optim_config, override_model_config):
         from megatron.core.models.gpt.gpt_model import ModelType
 
@@ -370,6 +371,24 @@ class ActorRolloutRefWorker(MegatronWorker):
         torch.cuda.empty_cache()
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_model_and_optimizer_state(self):
+        if not self._is_actor:
+            raise ValueError("This worker does not have an actor model")
+        if self.actor_module is None or self.actor_optimizer is None:
+            raise ValueError("Actor model or optimizer not initialized")
+        
+        # Get sharded model state dictionary
+        model_state_dict = self.actor_module.state_dict()
+        
+        # Get optimizer state dictionary (Megatron's DistributedOptimizer)
+        optimizer_state_dict = self.actor_optimizer.state_dict()
+        
+        return {
+            "model_state_dict": model_state_dict,
+            "optimizer_state_dict": optimizer_state_dict
+        }
+        
     @register(dispatch_mode=Dispatch.MEGATRON_PP_AS_DP_PROTO)
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout

@@ -319,8 +319,15 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
+        try:
+            model_state = ray.get(self.actor_rollout_wg.get_model_state.remote())
+        except AttributeError as e:
+            raise RuntimeError("Actor worker does not support get_model_state") from e
 
-        meta_optimizer = torch.optim.Adam(self._get_worker_parameters(self.actor_rollout_wg), lr=self.meta_lr)
+        meta_optimizer = torch.optim.Adam(model_state["parameters"], lr=self.inner_lr)
+        #model.parameters(),
+        #meta_optimizer = torch.optim.Adam(self._get_worker_parameters(self.actor_rollout_wg), lr=self.meta_lr)
+        #meta_optimizer = torch.optim.Adam(self.actor_rollout_wg.parameters(), lr=self.meta_lr)
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
         self.global_steps += 1

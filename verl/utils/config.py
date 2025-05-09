@@ -16,6 +16,16 @@ from typing import Dict
 
 from omegaconf import DictConfig
 
+import yaml
+import argparse
+
+def merge_yaml_args(yaml_file, args):
+    with open(yaml_file, 'r') as f:
+        config = yaml.safe_load(f)
+    for key, value in vars(args).items():
+        if value is not None:
+            config[key] = value
+    return config
 
 def update_dict_with_config(dictionary: Dict, config: DictConfig):
     for key in dictionary:

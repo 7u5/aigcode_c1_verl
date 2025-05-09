@@ -37,6 +37,7 @@ class NVMegatronRayWorkerGroup(RayWorkerGroup, MegatronWorkerGroup):
         )
 
 
+
 class MegatronRayWorkerGroup(RayWorkerGroup, MegatronWorkerGroup):
     """
     MegatronWorkerGroup will query each worker of its megatron rank info and store it inside the WorkerGroup

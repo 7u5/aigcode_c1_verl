@@ -62,7 +62,45 @@ else:
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.megatron.optimizer import get_megatron_optimizer
+from verl.utils.megatron_utils import init_megatron_optim_config
+import logging
+logger = logging.getLogger(__name__)
+class OptimizerWithList(torch.optim.Adam):
+    """Custom Adam optimizer with a list() method to retrieve model parameters."""
+    def __init__(self, params, actor_wg, critic_wg=None, rm_wg=None, **kwargs):
+        self.actor_wg = actor_wg
+        self.critic_wg = critic_wg
+        self.rm_wg = rm_wg
+        params = self.get_models()
+        
+        super().__init__(params, **kwargs)
 
+    def get_models(self):
+        """Return a dictionary of model objects for actor, critic, and reward models."""
+
+        params = {}
+        p = {}
+        if self.actor_wg and hasattr(self.actor_wg, 'get_model'):
+            p['actor'] = ray.get(self.actor_wg.get_model.remote())
+            #params += list(ray.get(self.actor_wg.get_model.remote()))
+            #print(params)
+            params += p['actor']
+            print(len(params))
+            logger.debug("Retrieved actor model")
+        if self.critic_wg and hasattr(self.critic_wg, 'get_model'):
+            p['critic'] = ray.get(self.critic_wg.get_model.remote())
+            #params += list(ray.get(self.critic_wg.get_model.remote()))
+            params += p['critic']
+            print(len(params))
+            logger.debug("Retrieved critic model")
+        if self.rm_wg and hasattr(self.rm_wg, 'get_model'):
+            p['reward'] = ray.get(self.rm_wg.get_model.remote())
+            #params += list(ray.get(self.rm_wg.get_model.remote()))
+            params += p['reward']
+            print(len(params))
+            logger.debug("Retrieved reward model")
+        return params
 
 class AIGCodeC1Trainer(RayPPOTrainer):
     def __init__(
@@ -140,6 +178,26 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         scores = 1.0 / (1.0 + variance)  # Higher score for lower variance
         return torch.clamp(scores, 0.0, 1.0)
 
+    def _reweight_samples(self, pos_scores: torch.Tensor, neg_scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Re-weight positive and negative samples to minimize score differences."""
+        logger.info("Re-weighting positive and negative samples")
+
+        # Normalize scores to [0, 1]
+        pos_scores = (pos_scores - pos_scores.min()) / (pos_scores.max() - pos_scores.min() + 1e-8)
+        neg_scores = (neg_scores - neg_scores.min()) / (neg_scores.max() - neg_scores.min() + 1e-8)
+
+        # Compute weights to align distributions (inverse absolute difference from mean)
+        mean_score = (pos_scores.mean() + neg_scores.mean()) / 2
+        pos_weights = 1.0 / (torch.abs(pos_scores - mean_score) + 1e-8)
+        neg_weights = 1.0 / (torch.abs(neg_scores - mean_score) + 1e-8)
+
+        # Normalize weights
+        pos_weights = pos_weights / (pos_weights.sum() + 1e-8)
+        neg_weights = neg_weights / (neg_weights.sum() + 1e-8)
+
+        logger.info(f"Pos weights: {pos_weights.tolist()[:5]}, Neg weights: {neg_weights.tolist()[:5]}")
+        return pos_weights, neg_weights
+    
     def load_data(self):
         """Load and preprocess preference pair dataset."""
         self.dataset = PreferencePairDataset(
@@ -246,68 +304,68 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
                 
-        def _compute_preference_loss(self, batch: 'DataProto') -> torch.Tensor:
-            if not self.use_preference:
-                return torch.tensor(0.0, device=self.device)
+    def _compute_preference_loss(self, batch: 'DataProto') -> torch.Tensor:
+        if not self.use_preference:
+            return torch.tensor(0.0, device=self.device)
 
-            pos_batch, neg_batch = batch.split_pairs()
-            if pos_batch is None or neg_batch is None:
-                return torch.tensor(0.0, device=self.device)
+        pos_batch, neg_batch = batch.split_pairs()
+        if pos_batch is None or neg_batch is None:
+            return torch.tensor(0.0, device=self.device)
 
-            # Generate multiple samples for positive and negative batches
-            pos_log_probs_samples = []
-            neg_log_probs_samples = []
-            for _ in range(self.num_samples):
-                pos_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))
-                neg_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))
-                pos_log_probs_samples.append(pos_result["log_probs"])
-                neg_log_probs_samples.append(neg_result["log_probs"])
+        # Generate multiple samples for positive and negative batches
+        pos_log_probs_samples = []
+        neg_log_probs_samples = []
+        for _ in range(self.num_samples):
+            pos_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))
+            neg_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))
+            pos_log_probs_samples.append(pos_result["log_probs"])
+            neg_log_probs_samples.append(neg_result["log_probs"])
 
-            # Stack samples: [num_samples, batch_size]
-            pos_log_probs_samples = torch.stack(pos_log_probs_samples, dim=0)
-            neg_log_probs_samples = torch.stack(neg_log_probs_samples, dim=0)
+        # Stack samples: [num_samples, batch_size]
+        pos_log_probs_samples = torch.stack(pos_log_probs_samples, dim=0)
+        neg_log_probs_samples = torch.stack(neg_log_probs_samples, dim=0)
 
-            # Compute meta RM scores for each sample
-            pos_scores = self._meta_rm_score(pos_log_probs_samples, pos_batch)
-            neg_scores = self._meta_rm_score(neg_log_probs_samples, neg_batch)
+        # Compute meta RM scores for each sample
+        pos_scores = self._meta_rm_score(pos_log_probs_samples, pos_batch)
+        neg_scores = self._meta_rm_score(neg_log_probs_samples, neg_batch)
 
-            # Filter samples: keep those with scores > threshold (e.g., 0.5)
-            threshold = 0.5
-            pos_mask = pos_scores > threshold
-            neg_mask = neg_scores > threshold
-            pos_log_probs_filtered = pos_log_probs_samples[pos_mask]
-            neg_log_probs_filtered = neg_log_probs_samples[neg_mask]
+        # Filter samples: keep those with scores > threshold (e.g., 0.5)
+        threshold = 0.5
+        pos_mask = pos_scores > threshold
+        neg_mask = neg_scores > threshold
+        pos_log_probs_filtered = pos_log_probs_samples[pos_mask]
+        neg_log_probs_filtered = neg_log_probs_samples[neg_mask]
 
-            # If no samples pass the threshold, use mean as fallback
-            if pos_log_probs_filtered.numel() == 0:
-                pos_log_probs_filtered = pos_log_probs_samples.mean(dim=0, keepdim=True)
-                pos_scores = torch.ones_like(pos_scores[0:1])
-            if neg_log_probs_filtered.numel() == 0:
-                neg_log_probs_filtered = neg_log_probs_samples.mean(dim=0, keepdim=True)
-                neg_scores = torch.ones_like(neg_scores[0:1])
+        # If no samples pass the threshold, use mean as fallback
+        if pos_log_probs_filtered.numel() == 0:
+            pos_log_probs_filtered = pos_log_probs_samples.mean(dim=0, keepdim=True)
+            pos_scores = torch.ones_like(pos_scores[0:1])
+        if neg_log_probs_filtered.numel() == 0:
+            neg_log_probs_filtered = neg_log_probs_samples.mean(dim=0, keepdim=True)
+            neg_scores = torch.ones_like(neg_scores[0:1])
 
-            # Voting: Weighted average based on meta RM scores
-            pos_weights = pos_scores[pos_mask] / pos_scores[pos_mask].sum()
-            neg_weights = neg_scores[neg_mask] / neg_scores[neg_mask].sum()
-            pos_log_probs = torch.sum(pos_log_probs_filtered * pos_weights.view(-1, 1), dim=0)
-            neg_log_probs = torch.sum(neg_log_probs_filtered * neg_weights.view(-1, 1), dim=0)
+        # Voting: Weighted average based on meta RM scores
+        pos_weights = pos_scores[pos_mask] / pos_scores[pos_mask].sum()
+        neg_weights = neg_scores[neg_mask] / neg_scores[neg_mask].sum()
+        pos_log_probs = torch.sum(pos_log_probs_filtered * pos_weights.view(-1, 1), dim=0)
+        neg_log_probs = torch.sum(neg_log_probs_filtered * neg_weights.view(-1, 1), dim=0)
 
-            # Apply difficulty coefficient (delta) from batch
-            difficulty_coeff = compute_difficulty_coeff(
-                log_probs=pos_log_probs_samples.mean(0),
-                values=ray.get(self.critic_wg.compute_values.remote(pos_batch)),
-                rewards=pos_batch.batch["rewards"],
-                response_mask=pos_batch.batch["response_mask"],
-                task_features={"seq_length": pos_batch.batch["seq_length"], "reward_sparsity": 0.5},
-                mode="k_fold"
-            )
-            batch.batch.set("difficulty_coeff", torch.tensor(difficulty_coeff, device=self.device))
-            #delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
-            delta = difficulty_coeff
-            logits = delta * (pos_log_probs - neg_log_probs)
-            logits = torch.clamp(logits, -10, 10)
-            loss = -torch.mean(torch.log(torch.sigmoid(logits)))
-            return loss
+        # Apply difficulty coefficient (delta) from batch
+        difficulty_coeff = compute_difficulty_coeff(
+            log_probs=pos_log_probs_samples.mean(0),
+            values=ray.get(self.critic_wg.compute_values.remote(pos_batch)),
+            rewards=pos_batch.batch["rewards"],
+            response_mask=pos_batch.batch["response_mask"],
+            task_features={"seq_length": pos_batch.batch["seq_length"], "reward_sparsity": 0.5},
+            mode="k_fold"
+        )
+        batch.batch.set("difficulty_coeff", torch.tensor(difficulty_coeff, device=self.device))
+        #delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
+        delta = difficulty_coeff
+        logits = delta * (pos_log_probs - neg_log_probs)
+        logits = torch.clamp(logits, -10, 10)
+        loss = -torch.mean(torch.log(torch.sigmoid(logits)))
+        return loss
 
     def _compute_value_aware_loss(self, batch: 'DataProto') -> torch.Tensor:
         if not self.use_vapo:
@@ -347,13 +405,38 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         value_aware_loss = -torch.mean(delta * log_probs * advantages * values)
         return value_aware_loss
 
-    def _inner_loop_adaptation(self, batch: 'DataProto') -> dict:
-        try:
-            model_state = ray.get(self.actor_rollout_wg.get_model_state.remote())
-        except AttributeError as e:
-            raise RuntimeError("Actor worker does not support get_model_state") from e
 
-        optimizer = torch.optim.Adam(model_state["parameters"], lr=self.inner_lr)
+    def _inner_loop_adaptation(self, batch: 'DataProto') -> dict:
+        # Fetch model and optimizer state from actor_rollout_wg
+        try:
+            worker_states = ray.get(self.actor_rollout_wg.get_model_and_optimizer_state.remote())
+        except Exception as e:
+            raise RuntimeError("Failed to retrieve model and optimizer state from actor worker") from e
+
+        # Aggregate sharded model state dictionaries
+        model_state_dict = {}
+        for worker_state in worker_states:
+            for key, value in worker_state["model_state_dict"].items():
+                if key not in model_state_dict:
+                    model_state_dict[key] = value
+                else:
+                    # Handle sharded parameters (e.g., average or concatenate based on parallelism)
+                    model_state_dict[key] += value  # Adjust based on Megatron's sharding strategy
+                    
+        try:
+            # Load aggregated model state (optional, if adaptation modifies parameters)
+            self.actor_rollout_wg.actor_module.load_state_dict(model_state_dict, strict=False)
+        except Exception as e:
+            logger.error(f"Failed to retrieve model and optimizer state from actor worker: {e}", exc_info=True)
+            raise RuntimeError("Failed to retrieve model and optimizer state from actor worker") from e
+        
+        # Use the existing Megatron optimizer or create a new one
+        optim_config = init_megatron_optim_config(self.config.actor.optim)
+        optimizer = get_megatron_optimizer(model=self.actor_rollout_wg.actor_module, config=optim_config)
+        
+
+        # Optionally, load optimizer state from workers (if needed for adaptation)
+        optimizer.load_state_dict(worker_states[0]["optimizer_state_dict"])  # Use first worker's state or aggregate
 
         for _ in range(self.inner_steps):
             optimizer.zero_grad()
@@ -388,7 +471,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             loss.backward()
             optimizer.step()
 
-        return model_state
+        return optimizer
     
     def _get_worker_parameters(self, worker):
         try:
@@ -404,8 +487,6 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             raise RuntimeError(f"Worker {worker} does not support set_model_parameters") from e
 
     def _validate(self):
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info("Starting validation")
         if not hasattr(self, 'val_dataloader') or self.val_dataloader is None:
             logger.warning("No validation dataloader available, skipping validation")
@@ -565,8 +646,30 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        meta_optimizer = torch.optim.Adam(self._get_worker_parameters(self.actor_rollout_wg), lr=self.meta_lr)
+        # Initialize or fetch model and optimizer state
+        try:
+            worker_states = ray.get(self.actor_rollout_wg.get_model_and_optimizer_state.remote())
+        except Exception as e:
+            raise RuntimeError("Failed to retrieve model and optimizer state from actor worker") from e
 
+        # Aggregate sharded model state dictionaries
+        model_state_dict = {}
+        for worker_state in worker_states:
+            for key, value in worker_state["model_state_dict"].items():
+                if key not in model_state_dict:
+                    model_state_dict[key] = value
+                else:
+                    model_state_dict[key] += value  # Adjust based on Megatron's sharding strategy
+
+        # Load aggregated model state
+        self.actor_rollout_wg.actor_module.load_state_dict(model_state_dict, strict=False)
+        
+        # Use the existing Megatron optimizer or create a new one
+        optim_config = init_megatron_optim_config(self.config.actor.optim)
+        meta_optimizer = get_megatron_optimizer(model=self.actor_rollout_wg.actor_module, config=optim_config)
+        
+
+    
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
         self.global_steps += 1
         last_val_metrics = None
@@ -734,3 +837,4 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+        return meta_optimizer
