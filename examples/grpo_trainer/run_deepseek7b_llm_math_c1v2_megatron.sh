@@ -38,7 +38,10 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation ov
 TIME_NOW=`date +%Y%m%d_%H%M%S`
 DIST_CKPT_PATH="ckpt.$TIME_NOW"
 CKPT_DIR="checkpoints"
+project_name="verl_aigcode_c1"
+export EXP_NAME="deepseek_7b_megatron_test"
 mkdir -p $DIST_CKPT_PATH
+mkdir -p $DIST_CKPT_PATH/$project_name/$EXP_NAME
 # 1. convert the model to mcore format
 #python -c "from transformers import AutoModel; AutoModel.from_pretrained('deepseek-ai/deepseek-llm-7b-chat', trust_remote_code=True, model_type="deepseek_v3")
 # local downloaded model path = /sharedata/osmodels/deepseek-math-7b-instruct
@@ -64,7 +67,7 @@ HYDRA_FULL_ERROR=1
 export PYTHONPATH=/sharedata/qiuwu/aigcode_c1_verl:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
-export EXP_NAME="deepseek_7b_megatron_test"
+
 #gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 #gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 #math_train_path=$HOME/data/math/train.parquet
@@ -133,7 +136,7 @@ python3 -m verl.trainer.main_aigcode_c1 --config-path=config \
     reward_model.model.path=null \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_aigcode_c1' \
+    trainer.project_name=$project_name \
     trainer.experiment_name=$EXP_NAME \
     trainer.n_gpus_per_node=$NUM_GPUS \
     trainer.nnodes=1 \

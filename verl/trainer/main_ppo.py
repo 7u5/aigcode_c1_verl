@@ -177,7 +177,8 @@ class TaskRunner:
             resource_pool_manager=resource_pool_manager,
         )
         trainer.init_workers.remote()
-        trainer.fit.remote()
+        result = trainer.fit.remote()
+        ray.get(result)
 
 
 if __name__ == "__main__":

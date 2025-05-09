@@ -57,14 +57,15 @@ def run_aigcode_c1(config):
         )
 
     runner = TaskRunner.remote()
+    ray.get(runner.run.remote(config))
     # Run the training task
-    try:
-        ray.get(runner.run.remote(config))
-    except Exception as e:
-        logger.error(f"Error in TaskRunner: {e}")
-        raise
-    finally:
-        ray.shutdown()
+    #try:
+    #    ray.get(runner.run.remote(config))
+    #except Exception as e:
+    #    logger.error(f"Error in TaskRunner: {e}")
+    #    raise
+    #finally:
+    #    ray.shutdown()
     
     logger.info("run_aigcode_c1 completed")
 

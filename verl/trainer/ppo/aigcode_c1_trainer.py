@@ -839,4 +839,4 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
-        return meta_optimizer
+        #return meta_optimizer
