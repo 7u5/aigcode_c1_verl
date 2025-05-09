@@ -32,16 +32,30 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-@hydra.main(config_path="config", config_name="aigcode_c1_meppogatron_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="aigcode_c1_megatron_trainer", version_base=None)
 def main(config):
+    """Main entry point for the script."""
+    # Merge Hydra config with command-line args
+    #config = merge_yaml_args(config)
+    
+    # Set environment variables
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["HYDRA_FULL_ERROR"] = "1"  # Enable full stack traces
     
-    wandb.init(project=config.trainer.project_name, name=config.trainer.experiment_name)
-    print("============++++==== Launch =============+++++++")
-    run_aigcode_c1(config)
-    print("============++++==== End =============+++++++")
+    # Get rank for distributed training
+    rank = int(os.environ.get('RANK', '0'))
+    
+    if rank == 0:
+        wandb.init(project=config.trainer.project_name, name=config.trainer.experiment_name)
+        print("============++++==== Launch =============+++++++")
+        run_aigcode_c1(config)
+        print("============++++==== End =============+++++++")
+    
+    # Clean up
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
+ 
 def run_aigcode_c1(config):
     """Run the AIGCode C1 training pipeline."""
     logger.info("Starting run_aigcode_c1")

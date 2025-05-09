@@ -102,6 +102,7 @@ class OptimizerWithList(torch.optim.Adam):
             logger.debug("Retrieved reward model")
         return params
 
+@ray.remote
 class AIGCodeC1Trainer(RayPPOTrainer):
     def __init__(
         self,
@@ -409,7 +410,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
     def _inner_loop_adaptation(self, batch: 'DataProto') -> dict:
         # Fetch model and optimizer state from actor_rollout_wg
         try:
-            worker_states = ray.get(self.actor_rollout_wg.get_model_and_optimizer_state.remote())
+            worker_states = self.actor_rollout_wg.get_model_and_optimizer_state()
         except Exception as e:
             raise RuntimeError("Failed to retrieve model and optimizer state from actor worker") from e
 
@@ -648,7 +649,8 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
         # Initialize or fetch model and optimizer state
         try:
-            worker_states = ray.get(self.actor_rollout_wg.get_model_and_optimizer_state.remote())
+            #worker_states = ray.get(self.actor_rollout_wg.get_model_and_optimizer_state.remote())
+            worker_states = self.actor_rollout_wg.get_model_and_optimizer_state()
         except Exception as e:
             raise RuntimeError("Failed to retrieve model and optimizer state from actor worker") from e
 

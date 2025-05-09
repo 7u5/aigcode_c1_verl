@@ -166,7 +166,7 @@ class TaskRunner:
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
         class_name = AIGCodeC1Trainer if config.algorithm.use_preference == True else RayPPOTrainer
-        trainer =  class_name(
+        trainer =  class_name.remote(
             config,
             tokenizer=tokenizer,
             processor=processor,
@@ -176,8 +176,8 @@ class TaskRunner:
             ray_worker_group_cls=ray_worker_group_cls,
             resource_pool_manager=resource_pool_manager,
         )
-        trainer.init_workers()
-        trainer.fit()
+        trainer.init_workers.remote()
+        trainer.fit.remote()
 
 
 if __name__ == "__main__":
