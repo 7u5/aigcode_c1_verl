@@ -15,7 +15,7 @@ if [ "$NUM_GPUS" -eq 0 ]; then
 else
   GPU_PER_NODE=${NUM_GPUS}
   MICRO_BATCH_SIZE=4
-  TENSOR_PARALLEL=2
+  TENSOR_PARALLEL=1
   # Check if GPUs support FP8 (e.g., NVIDIA H100 or newer)
   if nvidia-smi --query-gpu=name --format=csv,noheader | grep "H20Z"|wc -l; then
     DTYPE="fp8"  # H20Z/H200 fully support FP8; fallback to bfloat16
@@ -27,6 +27,7 @@ DTYPE="bfloat16"
 # Validate dataset paths
 HOME=/home/aigc
 
+MODEL_PATH="deepseek-ai/deepseek-llm-7b-chat"
 MODEL_PATH="deepseek-ai/deepseek-llm-7b-chat"
 
 # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
@@ -60,7 +61,7 @@ PIPLINE_PARALLEL=2
 CP=1
 VLLM_TP=$TENSOR_PARALLEL
 ppo_mini_batch_size=256
-micro_batch_size_per_gpu=8
+micro_batch_size_per_gpu=4
 
 #MASTER_ADDR="10.0.15.226"
 #MASTER_PORT="29500"
