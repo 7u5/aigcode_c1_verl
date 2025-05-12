@@ -1,4 +1,4 @@
-# Copyright 2024 AIGCode Ltd. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
-FSDP PPO Trainer with Ray-based single controller, enhanced with meta-learning, DAPO, and VAPO.
-This trainer supports model-agnostic model initialization with HuggingFace.
+FSDP PPO Trainer with Ray-based single controller.
+This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
@@ -25,7 +24,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, List, Tuple, Type
+from typing import Dict, Type
 
 import numpy as np
 import ray
@@ -35,7 +34,7 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role, AdvantageEstimator, ResourcePoolManager, apply_kl_penalty, _timer, compute_response_mask, compute_advantage, WorkerType
+
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
@@ -57,103 +56,424 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
-class AIGCodeC1Trainer(RayPPOTrainer):
-    def __init__(
-        self,
-        config,
-        tokenizer,
-        role_worker_mapping: dict[Role, ray.actor.ActorClass],
-        resource_pool_manager: ResourcePoolManager,
-        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-        processor=None,
-        reward_fn=None,
-        val_reward_fn=None,
-    ):
-        self.meta_lr = config.meta_learning.meta_lr
-        self.inner_lr = config.meta_learning.inner_lr
-        self.meta_steps = config.meta_learning.meta_steps
-        self.inner_steps = config.meta_learning.inner_steps
-        self.use_vapo = config.algorithm.use_vapo
-        self.use_preference = config.algorithm.use_preference
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.config = config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
-        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"
+from verl.utils.megatron.optimizer import get_megatron_optimizer
+from verl.utils.megatron_utils import get_model, init_megatron_optim_config, mcore_model_parallel_config
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, WorkerType, Role, AdvantageEstimator, ResourcePoolManager, apply_kl_penalty, compute_advantage, compute_response_mask, _timer
+from verl.models.mcore import hf_to_mcore_config
+import torch.optim as optim
+from megatron.core import mpu
+from megatron.core.models.gpt import GPTModel
+from megatron.core.transformer import TransformerConfig
+from megatron.core.models.gpt.gpt_model import ModelType
 
-        if not ray.is_initialized():
-            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            ray.init(
-                num_gpus=num_gpus,
-                runtime_env={
-                    "env_vars": {
-                        "TOKENIZERS_PARALLELISM": "true",
-                        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-                    }
-                },
-            )
-            print(f"Ray initialized with {num_gpus} GPUs")
+from verl.utils.megatron_utils import unwrap_model
+from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel, _megatron_calc_layer_map
+from transformers import AutoModelForCausalLM, AutoConfig
 
-        print("Role worker mapping:", role_worker_mapping)
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = (
-            config.actor_rollout_ref.ref.log_prob_micro_batch_size
-            or config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu
+import logging
+logger = logging.getLogger(__name__)
+
+
+def compute_meta_rm_scores(
+    log_probs_samples: torch.Tensor,
+    response_mask: torch.Tensor,
+    difficulty_coeff: torch.Tensor = None,
+    agent_performance: torch.Tensor = None,
+    curriculum_progress: float = 0.5,
+    mode: str = "variance",
+):
+    """Compute meta-RM scores with curriculum progress adjustment."""
+    with torch.no_grad():
+        if mode == "variance":
+            masked_log_probs = log_probs_samples * response_mask.unsqueeze(0)
+            variance = torch.var(masked_log_probs, dim=-1, keepdim=True).squeeze(-1)
+            scores = 1.0 / (1.0 + variance)
+        elif mode == "entropy":
+            probs = torch.softmax(log_probs_samples, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+            entropy = (entropy * response_mask.unsqueeze(0)).sum(-1) / response_mask.sum(-1).unsqueeze(0)
+            scores = 1.0 / (1.0 + entropy)
+        
+        # Adjust scores based on curriculum progress
+        if agent_performance is not None:
+            performance_factor = torch.sigmoid(agent_performance)
+            scores = scores * (1 - curriculum_progress + curriculum_progress * performance_factor)
+        
+        if difficulty_coeff is not None:
+            scores = scores * difficulty_coeff.view(1, -1)
+        
+        scores = torch.clamp(scores, 0.0, 1.0)
+    return scores
+
+def hierarchical_multi_gate_weights(
+    scores: torch.Tensor,
+    difficulty_coeff: torch.Tensor = None,
+    curriculum_progress: float = 0.5,
+    gate_factors: list = None,
+    gate_weights: list = None,
+):
+    """Compute hierarchical multi-gate weights with curriculum progress."""
+    if gate_factors is None:
+        gate_factors = ["score", "difficulty", "progress"]
+        gate_weights = [1.0, 0.5, 0.3]
+    
+    weights = torch.ones_like(scores)
+    for factor, weight in zip(gate_factors, gate_weights):
+        if factor == "score":
+            weights = weights * scores ** weight
+        elif factor == "difficulty" and difficulty_coeff is not None:
+            weights = weights * (difficulty_coeff.view(1, -1) ** weight)
+        elif factor == "progress":
+            weights = weights * (1.0 + curriculum_progress) ** weight
+    
+    weights = weights / (weights.sum(dim=0, keepdim=True) + 1e-8)
+    return weights
+
+
+
+def gather_tp_shards(tensor_name, state_dict, config, tp_size):
+    from torch.distributed import all_gather
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    full_tensor = state_dict[tensor_name]
+    tensor_chunks = torch.chunk(full_tensor, tp_size, dim=0)
+    gathered_chunks = [torch.empty_like(tensor_chunks[0]) for _ in range(tp_size)]
+    all_gather(gathered_chunks, tensor_chunks[tp_rank], group=mpu.get_tensor_model_parallel_group())
+    return torch.cat(gathered_chunks, dim=0)
+
+def aggregate_state_dicts(actors, config = None):
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    state_dicts = [ray.get(actor.get_state_dict.remote()) for actor in actors]
+    global_state_dict = {}
+    if pp_rank == 0:
+        global_state_dict["model.embed_tokens.weight"] = gather_tp_shards(
+            "model.embed_tokens.weight", state_dicts[0], config, mpu.get_tensor_model_parallel_world_size()
         )
-        self.use_rm = config.reward_model.enable
-        self.ray_worker_group_cls = ray_worker_group_cls
-        self.validation_generations_logger = ValidationGenerationsLogger()
+    layer_map = _megatron_calc_layer_map(config)
+    for layer in range(config.num_hidden_layers):
+        layer_name = f"model.layers.{layer}"
+        dst_pp_rank, dst_virtual_pp_rank, dst_layer_idx = layer_map[layer]
+        if pp_rank == dst_pp_rank:
+            state_dict = state_dicts[dst_virtual_pp_rank]
+            for param_name in [
+                f"{layer_name}.input_layernorm.weight",
+                f"{layer_name}.self_attn.q_proj.weight",
+                f"{layer_name}.self_attn.k_proj.weight",
+                f"{layer_name}.self_attn.v_proj.weight",
+                f"{layer_name}.self_attn.o_proj.weight",
+                f"{layer_name}.post_attention_layernorm.weight",
+                f"{layer_name}.mlp.gate_proj.weight",
+                f"{layer_name}.mlp.up_proj.weight",
+                f"{layer_name}.mlp.down_proj.weight",
+            ]:
+                global_state_dict[param_name] = gather_tp_shards(
+                    param_name, state_dict, config, mpu.get_tensor_model_parallel_world_size()
+                )
+    if pp_rank == mpu.get_pipeline_model_parallel_world_size() - 1:
+        global_state_dict["model.norm.weight"] = gather_tp_shards(
+            "model.norm.weight", state_dicts[-1], config, mpu.get_tensor_model_parallel_world_size()
+        )
+        global_state_dict["lm_head.weight"] = gather_tp_shards(
+            "lm_head.weight", state_dicts[-1], config, mpu.get_tensor_model_parallel_world_size()
+        )
+    return global_state_dict
 
-        if config.algorithm.use_kl_in_reward:
-            self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
-        self.use_critic = config.algorithm.adv_estimator == AdvantageEstimator.GAE
-        if not self.use_critic and config.algorithm.adv_estimator not in [
-            AdvantageEstimator.GRPO,
-            AdvantageEstimator.REINFORCE_PLUS_PLUS,
-            AdvantageEstimator.REMAX,
-            AdvantageEstimator.RLOO,
-            AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-        ]:
-            raise NotImplementedError(f"Unsupported advantage estimator: {config.algorithm.adv_estimator}")
-
-        self._validate_config()
-        self._create_dataloader()
-
-    def _compute_preference_loss(self, batch: DataProto):
+class AIGCodeC1Trainer(RayPPOTrainer):
+         
+    def _compute_preference_loss(self, batch: 'DataProto') -> torch.Tensor:
         if not self.use_preference:
             return torch.tensor(0.0, device=self.device)
+
         pos_batch, neg_batch = batch.split_pairs()
         if pos_batch is None or neg_batch is None:
             return torch.tensor(0.0, device=self.device)
-        pos_log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))["log_probs"]
-        neg_log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))["log_probs"]
-        logits = pos_log_probs - neg_log_probs
+
+        # Generate multiple samples for positive and negative batches
+        pos_log_probs_samples = []
+        neg_log_probs_samples = []
+        for _ in range(self.num_samples):
+            pos_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(pos_batch))
+            neg_result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(neg_batch))
+            pos_log_probs_samples.append(pos_result["log_probs"])
+            neg_log_probs_samples.append(neg_result["log_probs"])
+
+        # Stack samples: [num_samples, batch_size]
+        pos_log_probs_samples = torch.stack(pos_log_probs_samples, dim=0)
+        neg_log_probs_samples = torch.stack(neg_log_probs_samples, dim=0)
+
+        # Compute meta RM scores for each sample
+        pos_scores = self._meta_rm_score(pos_log_probs_samples, pos_batch)
+        neg_scores = self._meta_rm_score(neg_log_probs_samples, neg_batch)
+
+        # Filter samples: keep those with scores > threshold (e.g., 0.5)
+        threshold = 0.5
+        pos_mask = pos_scores > threshold
+        neg_mask = neg_scores > threshold
+        pos_log_probs_filtered = pos_log_probs_samples[pos_mask]
+        neg_log_probs_filtered = neg_log_probs_samples[neg_mask]
+
+        # If no samples pass the threshold, use mean as fallback
+        if pos_log_probs_filtered.numel() == 0:
+            pos_log_probs_filtered = pos_log_probs_samples.mean(dim=0, keepdim=True)
+            pos_scores = torch.ones_like(pos_scores[0:1])
+        if neg_log_probs_filtered.numel() == 0:
+            neg_log_probs_filtered = neg_log_probs_samples.mean(dim=0, keepdim=True)
+            neg_scores = torch.ones_like(neg_scores[0:1])
+
+        # Voting: Weighted average based on meta RM scores
+        pos_weights = pos_scores[pos_mask] / pos_scores[pos_mask].sum()
+        neg_weights = neg_scores[neg_mask] / neg_scores[neg_mask].sum()
+        pos_log_probs = torch.sum(pos_log_probs_filtered * pos_weights.view(-1, 1), dim=0)
+        neg_log_probs = torch.sum(neg_log_probs_filtered * neg_weights.view(-1, 1), dim=0)
+
+        # Apply difficulty coefficient (delta) from batch
+        difficulty_coeff = compute_difficulty_coeff(
+            log_probs=pos_log_probs_samples.mean(0),
+            values=ray.get(self.critic_wg.compute_values.remote(pos_batch)),
+            rewards=pos_batch.batch["rewards"],
+            response_mask=pos_batch.batch["response_mask"],
+            task_features={"seq_length": pos_batch.batch["seq_length"], "reward_sparsity": 0.5},
+            mode="k_fold"
+        )
+        batch.batch.set("difficulty_coeff", torch.tensor(difficulty_coeff, device=self.device))
+        #delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
+        delta = difficulty_coeff
+        logits = delta * (pos_log_probs - neg_log_probs)
         logits = torch.clamp(logits, -10, 10)
         loss = -torch.mean(torch.log(torch.sigmoid(logits)))
         return loss
 
-    def _compute_value_aware_loss(self, batch: DataProto):
+    def _compute_value_aware_loss(self, batch: 'DataProto') -> torch.Tensor:
         if not self.use_vapo:
             return torch.tensor(0.0, device=self.device)
+        # Compute values
         values = ray.get(self.critic_wg.compute_values.remote(batch))
         values = (values - values.mean()) / (values.std() + 1e-8)
         advantages = batch.batch["advantages"]
-        log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
-        value_aware_loss = -torch.mean(log_probs * advantages * values)
+
+        # Generate multiple samples for log-probabilities
+        log_probs_samples = []
+        for _ in range(self.num_samples):
+            result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
+            log_probs_samples.append(result["log_probs"])
+
+        # Stack samples: [num_samples, batch_size]
+        log_probs_samples = torch.stack(log_probs_samples, dim=0)
+
+        # Compute meta RM scores
+        scores = self._meta_rm_score(log_probs_samples, batch)
+
+        # Filter samples
+        mask = scores > 0.5
+        log_probs_filtered = log_probs_samples[mask]
+
+        # Fallback to mean if no samples pass
+        if log_probs_filtered.numel() == 0:
+            log_probs_filtered = log_probs_samples.mean(dim=0, keepdim=True)
+            scores = torch.ones_like(scores[0:1])
+
+        # Voting: Weighted average
+        weights = scores[mask] / scores[mask].sum()
+        log_probs = torch.sum(log_probs_filtered * weights.view(-1, 1), dim=0)
+
+        # Apply difficulty coefficient
+        delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
+        value_aware_loss = -torch.mean(delta * log_probs * advantages * values)
         return value_aware_loss
+    
+    def get_optim(self, config):
+        from verl.utils.model import get_parallel_gptmodel_from_config
+        meta_model = get_parallel_gptmodel_from_config()
+        optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
+        optimizer = get_megatron_optimizer(model=meta_model, config=optim_config)
+        return optimizer, meta_model        
+        
+    def get_model_and_optim(self, config):
+        # Assume config is defined (Megatron configuration)
+        # Assume self.actor_rollout_wg is a list of Ray actors
+        global_state_dict = aggregate_state_dicts(self.actor_rollout_wg, self.get_model_config())
 
-    def _inner_loop_adaptation(self, batch: DataProto):
-        try:
-            model_state = ray.get(self.actor_rollout_wg.get_model_state.remote())
-        except AttributeError as e:
-            raise RuntimeError("Actor worker does not support get_model_state") from e
+        # Create a non-sharded model for meta-learning
+        meta_model = GPTModel(config)
+        meta_model.load_state_dict(global_state_dict)
+        if isinstance(meta_model, list):
+            meta_model = meta_model[0]
+        # Create meta-optimizer
+        optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
+        optimizer = get_megatron_optimizer(model=meta_model, config=optim_config)
+        return optimizer, meta_model
 
-        optimizer = torch.optim.Adam(model_state["parameters"], lr=self.inner_lr)
+        # Meta-learning loop (simplified)
+        '''
+        for meta_task_data, tasks in meta_learning_dataset:
+            # Inner-loop training
+            task_state_dicts = []
+            for actor, task_data in zip(self.actor_rollout_wg, tasks):
+                @ray.remote
+                def inner_loop(actor, task_data):
+                    model = ray.get(actor.get_model.remote())
+                    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+                    for data in task_data:
+                        loss = compute_loss(model, data)  # Define compute_loss
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                    return ray.get(actor.get_state_dict.remote())
+                task_state_dicts.append(ray.get(inner_loop.remote(actor, task_data)))
+
+            # Aggregate updated parameters
+            global_state_dict = aggregate_state_dicts(task_state_dicts, config)
+            meta_model.load_state_dict(global_state_dict)
+        '''
+
+
+    def get_model_and_optimizer_state(self):
+        if isinstance(self.actor_rollout_wg.actor_module, list):
+            model_state_dict = {i: module.state_dict() for i, module in enumerate(self.actor_rollout_wg.actor_module)}
+        else:
+            model_state_dict = self.actor_rollout_wg.actor_module.state_dict()
+        return model_state_dict
+
+    def get_model_config(self):
+        # Load Hugging Face model configuration
+        hf_config = AutoConfig.from_pretrained(self.config.actor_rollout_ref.model.path)
+        # Convert to Megatron TransformerConfig
+        megatron_config = self.config.actor_rollout_ref.actor.megatron
+        transformer_config = TransformerConfig(
+            num_layers=hf_config.num_hidden_layers,
+            hidden_size=hf_config.hidden_size,
+            num_attention_heads=hf_config.num_attention_heads,
+            num_query_groups=hf_config.num_key_value_heads,
+            ffn_hidden_size=hf_config.intermediate_size,
+            activation_func=torch.nn.functional.silu,
+            normalization="RMSNorm",
+            gated_linear_unit=True,
+            use_cpu_initialization=True,
+            add_bias_linear=False,
+            moe_token_dispatcher_type="alltoall",  # Explicitly set to alltoall
+            tensor_model_parallel_size=megatron_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=megatron_config.pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size=megatron_config.get("virtual_pipeline_model_parallel_size", None),
+            context_parallel_size=megatron_config.get("context_parallel_size", 1),
+            overlap_p2p_comm=megatron_config.get("overlap_p2p_comm", False),
+            batch_p2p_comm=megatron_config.get("batch_p2p_comm", False),
+            pipeline_dtype=torch.bfloat16,
+            params_dtype=torch.bfloat16,
+            sequence_parallel=megatron_config.tensor_model_parallel_size > 1,
+            variable_seq_lengths=True,
+            masked_softmax_fusion=True,
+            attention_dropout=hf_config.attention_dropout,
+            hidden_dropout=getattr(hf_config, "hidden_dropout", 0.0),
+            add_qkv_bias=getattr(hf_config, "attention_bias", False),
+            attention_backend="flash",
+            bf16=True,
+        )
+            
+        return transformer_config
+
+    def create_model_provider(self, config):
+        def model_provider_func(pre_process=True, post_process=True, add_encoder=True, add_decoder=True):
+            transformer_config = self.get_model_config()
+            # Load the model
+            model = AutoModelForCausalLM.from_pretrained(
+                config.model.path,
+                torch_dtype=torch.bfloat16,
+                device_map=None,  # Megatron handles device placement
+                trust_remote_code=True,
+            )
+
+            # Enable gradient checkpointing
+            if config.model.enable_gradient_checkpointing:
+                model.gradient_checkpointing_enable()
+
+            # Set Megatron-specific attributes
+            model.config = transformer_config
+            model.pre_process = pre_process
+            model.post_process = post_process
+            return model
+        return model_provider_func
+
+    def get_model_and_optim2(self, config):
+        model = self.get_model_and_optimizer_state()
+        if isinstance(model, list):
+            model = model[0]
+        optim_config = init_megatron_optim_config(config.actor.optim)
+        optimizer = get_megatron_optimizer(model=model, config=optim_config)
+        return optimizer, model
+       
+    
+    def get_model_and_optim3(self, config):
+        from megatron.core import mpu
+        env_vars = {k: v for k, v in os.environ.items() if k in ['WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES']}
+        print("get_model_and_optim: Environment variables:", env_vars)
+        print("get_model_and_optim: torch.distributed initialized:", torch.distributed.is_initialized())
+        print("get_model_and_optim: Available GPUs:", torch.cuda.device_count())
+        print("get_model_and_optim: actor_rollout_wg attributes:", dir(self.actor_rollout_wg))
+
+        # Validate distributed context
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("torch.distributed is not initialized. Ensure TaskRunner or NVMegatronRayWorkerGroup sets up the distributed context.")
+
+        # Validate world_size
+        world_size = torch.distributed.get_world_size()
+        required_gpus = config.actor.megatron.tensor_model_parallel_size * config.actor.megatron.pipeline_model_parallel_size
+        if world_size != required_gpus:
+            raise ValueError(f"world_size ({world_size}) does not match required GPUs ({required_gpus}) for tensor_model_parallel_size={config.actor.megatron.tensor_model_parallel_size} and pipeline_model_parallel_size={config.actor.megatron.pipeline_model_parallel_size}")
+
+        # Initialize Megatron parallelism
+        print("get_model_and_optim: Initializing Megatron model parallel")
+        if not mpu.is_initialized():
+            mpu.initialize_model_parallel(
+                tensor_model_parallel_size=config.actor.megatron.tensor_model_parallel_size,
+                pipeline_model_parallel_size=config.actor.megatron.pipeline_model_parallel_size
+            )
+
+        # Create model provider and initialize model
+        model_provider = self.create_model_provider(self.config.actor_rollout_ref)
+        model = get_model(
+            model_provider_func=model_provider,
+            model_type=ModelType.encoder_or_decoder,
+            wrap_with_ddp=True,
+            use_distributed_optimizer=True
+        )
+
+        # Handle pipeline parallelism
+        if isinstance(model, list):
+            model = model[0]
+
+        # Initialize optimizer
+        optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
+        optimizer = get_megatron_optimizer(model=model, config=optim_config)
+        return optimizer, model
+    
+    def get_model_and_optim_bad(self, config):
+        # Initialize optimizer config
+        optim_config = init_megatron_optim_config(config.actor.optim)
+        def megatron_value_model_provider(pre_process, post_process):
+            from verl.utils.model import get_parallel_gptmodel_from_config
+            parallel_model = get_parallel_gptmodel_from_config(
+                hf_to_mcore_config(config, torch.bfloat16), config, pre_process, post_process, share_embeddings_and_output_weights=False, value=True
+            )
+            parallel_model.cuda()
+            return parallel_model
+        
+        model = self.model if self.model is not None else get_model(
+            model_provider_func=megatron_value_model_provider,
+            model_type=ModelType.encoder_or_decoder,
+            wrap_with_ddp=True,
+        )
+        
+        # Handle pipeline parallelism: select the first model if a list is returned
+        if isinstance(model, list):
+            model = model[0]
+            
+        optimizer = get_megatron_optimizer(model=model, config=optim_config)
+        return optimizer, model
+     
+     
+    def _inner_loop_adaptation(self, batch: 'DataProto') -> dict:
+        # Fetch model and optimizer state from actor_rollout_wg
+        optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
 
         for _ in range(self.inner_steps):
             optimizer.zero_grad()
@@ -163,14 +483,33 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             if self.use_vapo:
                 loss += self._compute_value_aware_loss(batch)
             else:
-                log_probs = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
+                # Generate multiple samples for default loss
+                log_probs_samples = []
+                for _ in range(self.num_samples):
+                    result = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
+                    log_probs_samples.append(result["log_probs"])
+
+                log_probs_samples = torch.stack(log_probs_samples, dim=0)
+                scores = self._meta_rm_score(log_probs_samples, batch)
+                mask = scores > 0.5
+                log_probs_filtered = log_probs_samples[mask]
+
+                if log_probs_filtered.numel() == 0:
+                    log_probs_filtered = log_probs_samples.mean(dim=0, keepdim=True)
+                    scores = torch.ones_like(scores[0:1])
+
+                weights = scores[mask] / scores[mask].sum()
+                log_probs = torch.sum(log_probs_filtered * weights.view(-1, 1), dim=0)
+
                 advantages = batch.batch["advantages"]
-                loss += -torch.mean(log_probs * advantages)
+                delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
+                loss += -torch.mean(delta * log_probs * advantages)
+
             loss.backward()
             optimizer.step()
 
-        return model_state
-
+        return optimizer
+    
     def _get_worker_parameters(self, worker):
         try:
             params = ray.get(worker.get_model_parameters.remote())
@@ -184,121 +523,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         except AttributeError as e:
             raise RuntimeError(f"Worker {worker} does not support set_model_parameters") from e
 
-    def _validate_config(self):
-        config = self.config
-        n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % n_gpus == 0, (
-            f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
-        )
-
-        def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
-            settings = {
-                "actor_rollout_ref.actor": "micro_batch_size",
-                "critic": "micro_batch_size",
-                "reward_model": "micro_batch_size",
-                "actor_rollout_ref.ref": "log_prob_micro_batch_size",
-                "actor_rollout_ref.rollout": "log_prob_micro_batch_size",
-            }
-            if name in settings:
-                param = settings[name]
-                param_per_gpu = f"{param}_per_gpu"
-                if mbs is None and mbs_per_gpu is None:
-                    raise ValueError(
-                        f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'."
-                    )
-                if mbs is not None and mbs_per_gpu is not None:
-                    raise ValueError(
-                        f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. "
-                        f"Please remove '{name}.{param}' because only '*_{param_per_gpu}' is supported."
-                    )
-
-        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
-            check_mutually_exclusive(
-                config.actor_rollout_ref.actor.ppo_micro_batch_size,
-                config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
-                "actor_rollout_ref.actor",
-            )
-            if self.use_reference_policy:
-                check_mutually_exclusive(
-                    config.actor_rollout_ref.ref.log_prob_micro_batch_size,
-                    config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
-                    "actor_rollout_ref.ref",
-                )
-            check_mutually_exclusive(
-                config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
-                config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
-                "actor_rollout_ref.rollout",
-            )
-
-        if self.use_critic and not config.critic.use_dynamic_bsz:
-            check_mutually_exclusive(
-                config.critic.ppo_micro_batch_size, config.critic.ppo_micro_batch_size_per_gpu, "critic"
-            )
-
-        if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
-            check_mutually_exclusive(
-                config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
-            )
-
-        if not config.actor_rollout_ref.actor.use_dynamic_bsz:
-            assert config.data.train_batch_size >= config.actor_rollout_ref.actor.ppo_mini_batch_size
-            sp_size = config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
-            if config.actor_rollout_ref.actor.ppo_micro_batch_size is not None:
-                assert (
-                    config.actor_rollout_ref.actor.ppo_mini_batch_size
-                    % config.actor_rollout_ref.actor.ppo_micro_batch_size
-                    == 0
-                )
-                assert config.actor_rollout_ref.actor.ppo_micro_batch_size * sp_size >= n_gpus
-
-        assert config.actor_rollout_ref.actor.loss_agg_mode in [
-            "token-mean",
-            "seq-mean-token-sum",
-            "seq-mean-token-mean",
-            "seq-mean-token-sum-norm",
-        ], f"Invalid loss_agg_mode: {config.actor_rollout_ref.actor.loss_agg_mode}"
-
-        if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
-            print("NOTICE: You have both enabled in-reward KL and KL loss.")
-
-        if self.use_critic and not config.critic.use_dynamic_bsz:
-            assert config.data.train_batch_size >= config.critic.ppo_mini_batch_size
-            sp_size = config.critic.get("ulysses_sequence_parallel_size", 1)
-            if config.critic.ppo_micro_batch_size is not None:
-                assert config.critic.ppo_mini_batch_size % config.critic.ppo_micro_batch_size == 0
-                assert config.critic.ppo_micro_batch_size * sp_size >= n_gpus
-
-        if config.actor_rollout_ref.actor.strategy == "fsdp" and (
-            config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1) > 1
-            or config.actor_rollout_ref.ref.get("ulysses_sequence_parallel_size", 1) > 1
-        ):
-            assert config.actor_rollout_ref.model.use_remove_padding, (
-                "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
-            )
-
-        if self.use_critic and config.critic.strategy == "fsdp":
-            if config.critic.get("ulysses_sequence_parallel_size", 1) > 1:
-                assert config.critic.model.use_remove_padding, (
-                    "When using sequence parallelism for critic, you must enable `use_remove_padding`."
-                )
-
-        if config.data.get("val_batch_size", None) is not None:
-            print(
-                "WARNING: val_batch_size is deprecated. "
-                "Validation datasets are sent to inference engines as a whole batch."
-            )
-
-        if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
-            assert config.actor_rollout_ref.rollout.temperature > 0, (
-                "Validation gen temperature should be greater than 0 when enabling do_sample"
-            )
-
-        #if self.use_preference and not hasattr(self.train_dataset, "split_pairs"):
-        #    raise ValueError("Dataset must support split_pairs for preference optimization (DAPO).")
-
-        print("[validate_config] All configuration checks passed successfully!")
-
+   
     def fit(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -320,8 +545,8 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        meta_optimizer = torch.optim.Adam(self._get_worker_parameters(self.actor_rollout_wg), lr=self.meta_lr)
-
+        meta_optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
+    
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
         self.global_steps += 1
         last_val_metrics = None
@@ -489,3 +714,10 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+    def _meta_rm_score(self, log_probs: torch.Tensor, batch: 'DataProto') -> torch.Tensor:
+        """Placeholder for meta RM: scores sample quality based on log-prob variance."""
+        # Simulate meta RM by scoring samples based on stability (e.g., low variance)
+        variance = torch.var(log_probs, dim=-1, keepdim=True)
+        scores = 1.0 / (1.0 + variance)  # Higher score for lower variance
+        return torch.clamp(scores, 0.0, 1.0)

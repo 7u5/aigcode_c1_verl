@@ -433,7 +433,7 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
                     ssd.pop(k)
         dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
 
-    return
+    return 
 
 
 def get_parallel_gptmodel_from_config(

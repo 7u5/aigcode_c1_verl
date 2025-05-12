@@ -1,11 +1,17 @@
+meta_learning:
+  meta_lr: 1e-5
+  inner_lr: 1e-4
+  inner_steps: 5
+  meta_steps: 50
+
 data:
   tokenizer: null
-  train_files: ~/data/rlhf/gsm8k/train.parquet
-  val_files: ~/data/rlhf/gsm8k/test.parquet
+  train_files: ~/data/hf/BytedTsinghua-SIA_DAPO-Math-17k/data/dapo-math-17k.parquet
+  val_files: ~/data/hf/BytedTsinghua-SIA_AIME-2024/data/aime-2024.parquet
   prompt_key: prompt
   reward_fn_key: data_source
-  max_prompt_length: 512
-  max_response_length: 512
+  max_prompt_length: 3072
+  max_response_length: 1024
   train_batch_size: 1024
   val_batch_size: null # DEPRECATED: Validation datasets are sent to inference engines as a whole batch, which will schedule the memory themselves
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -18,6 +24,40 @@ data:
   custom_cls:
       path: verl/utils/dataset/c1_rl_dataset.py
       name: C1Dataset
+
+joint:
+  strategy: "megatron"
+  model:
+    path: "path/to/model_checkpoint"
+    trust_remote_code: false
+  optim:
+    total_training_steps: null
+  ppo_mini_batch_size: 32
+  ppo_micro_batch_size_per_gpu: 4
+  rollout:
+    n: 2
+    log_prob_micro_batch_size_per_gpu: 4
+    temperature: 1.0
+    val_kwargs:
+      do_sample: true
+      n: 2
+  tensor_model_parallel_size: 4
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  virtual_pipeline_model_parallel_size: 1
+  sequence_parallel: false
+  seed: 42
+  param_offload: true
+  optimizer_offload: true
+  use_distributed_optimizer: true
+  loss_agg_mode: "token-mean"
+  lambda_dapo: 1.0
+  lambda_vapo: 0.5
+  lambda_critic: 0.5
+  gamma: 0.99
+  meta_lr: 1e-5
+  inner_steps: 3
+  task_size: 32
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -209,24 +249,28 @@ custom_reward_function:
   name: compute_score
 
 algorithm:
-  gamma: 1.0
-  lam: 1.0
-  difficulty_mode: k_fold
-  adv_estimator: gae
+  adv_estimator: grpo
   norm_adv_by_std_in_grpo: True
-  use_kl_in_reward: False
-  kl_penalty: kl  # how to estimate kl divergence
+  use_kl_in_reward: True
+  use_preference: False
+  #kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
+  type: "aigcode_c1"  # Options: "ppo", "aigcode_c1"
+  use_vapo: true
+  gamma: 1.0
+  lam: 1.0
+  difficulty_mode: k_fold
+
 
 trainer:
   balance_batch: True
   total_epochs: 30
   total_training_steps: null
-  project_name: verl_examples
+  project_name: verl_aigcode_c1
   experiment_name: gsm8k
   logger: ['console', 'wandb']
   log_val_generations: 0
@@ -249,38 +293,3 @@ trainer:
 
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
-
-
-joint:
-  strategy: "megatron"
-  model:
-    path: "path/to/model_checkpoint"
-    trust_remote_code: false
-  optim:
-    total_training_steps: null
-  ppo_mini_batch_size: 32
-  ppo_micro_batch_size_per_gpu: 4
-  rollout:
-    n: 2
-    log_prob_micro_batch_size_per_gpu: 4
-    temperature: 1.0
-    val_kwargs:
-      do_sample: true
-      n: 2
-  tensor_model_parallel_size: 4
-  pipeline_model_parallel_size: 1
-  context_parallel_size: 1
-  virtual_pipeline_model_parallel_size: 1
-  sequence_parallel: false
-  seed: 42
-  param_offload: true
-  optimizer_offload: true
-  use_distributed_optimizer: true
-  loss_agg_mode: "token-mean"
-  lambda_dapo: 1.0
-  lambda_vapo: 0.5
-  lambda_critic: 0.5
-  gamma: 0.99
-  meta_lr: 1e-5
-  inner_steps: 3
-  task_size: 32

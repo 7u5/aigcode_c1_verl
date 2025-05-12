@@ -659,6 +659,14 @@ class RayPPOTrainer:
         return metric_dict
 
     def init_workers(self):
+        import ray
+        import torch.distributed as dist
+
+        print("init_workers: Starting worker initialization")
+        print("init_workers: torch.distributed initialized:", dist.is_initialized())
+        print("init_workers: Available GPUs:", torch.cuda.device_count())
+        print("init_workers: Resource pool GPUs:", self.resource_pool_manager.get_n_gpus())
+        print("init_workers: Ray available resources:", ray.available_resources())
         """Init resource pool and worker group"""
         self.resource_pool_manager.create_resource_pool()
 

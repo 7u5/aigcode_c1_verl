@@ -14,6 +14,7 @@ data:
     enable: false  # Set to true to use multi-turn dataset
     messages_key: messages  # Key for messages list in multi-turn mode
   max_length: 1024
+  max_samples: null
   truncation: error
   balance_dp_token: False
   chat_template: null
@@ -54,3 +55,37 @@ trainer:
   logger: ['console']
   seed: 1
 
+
+joint:
+  strategy: "megatron"
+  model:
+    path: "path/to/model_checkpoint"
+    trust_remote_code: false
+  optim:
+    total_training_steps: null
+  ppo_mini_batch_size: 32
+  ppo_micro_batch_size_per_gpu: 4
+  rollout:
+    n: 2
+    log_prob_micro_batch_size_per_gpu: 4
+    temperature: 1.0
+    val_kwargs:
+      do_sample: true
+      n: 2
+  tensor_model_parallel_size: 4
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  virtual_pipeline_model_parallel_size: 1
+  sequence_parallel: false
+  seed: 42
+  param_offload: true
+  optimizer_offload: true
+  use_distributed_optimizer: true
+  loss_agg_mode: "token-mean"
+  lambda_dapo: 1.0
+  lambda_vapo: 0.5
+  lambda_critic: 0.5
+  gamma: 0.99
+  meta_lr: 1e-5
+  inner_steps: 3
+  task_size: 32

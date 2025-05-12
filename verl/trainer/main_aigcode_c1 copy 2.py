@@ -20,12 +20,10 @@ import os
 import hydra
 import ray
 import torch
+
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.aigcode_c1_trainer import AIGCodeC1Trainer
 from verl.trainer.ppo.reward import load_reward_manager
-import datetime
-import logging
-logger = logging.getLogger(__name__)
 
 def get_custom_reward_fn(config):
     import importlib.util
@@ -65,133 +63,63 @@ def get_custom_reward_fn(config):
 @hydra.main(config_path="config", config_name="aigcode_c1_megatron_trainer", version_base=None)
 def main(config):
     run_c1(config)
-    
-import socket
-def is_port_free(port, host="localhost"):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1)
-        return s.connect_ex((host, int(port))) != 0
-    
+
+
 def run_c1(config) -> None:
     # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "8266"
-
-    # Check port availability
-    master_port = os.environ["MASTER_PORT"]
-    if not is_port_free(master_port):
-        raise RuntimeError(f"Port {master_port} is already in use. Choose a different MASTER_PORT.")
-
-    # Calculate world_size
-    required_gpus = config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size * \
-                    config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if gpu_count < required_gpus:
-        raise ValueError(f"Available GPUs ({gpu_count}) less than required ({required_gpus})")
-    world_size = required_gpus
-    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_PORT"] = "29500"
+    num_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+    os.environ["WORLD_SIZE"] = str(num_gpus)
     os.environ["RANK"] = os.environ.get("RANK", "0")
     
-     # Initialize Ray
+    world_size = int(os.environ.get('WORLD_SIZE', torch.cuda.device_count()))
+    rank = int(os.environ.get('RANK', 1))
+    master_addr = os.environ.get('MASTER_ADDR', 'localhost')
+    master_port = os.environ.get('MASTER_PORT', '29500')
+
+    # Initialize torch.distributed
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
+        print(f"torch.distributed initialized: world_size={world_size}, rank={rank}, master_addr={master_addr}, master_port={master_port}")
+        
+    # Initialize Ray
     if not ray.is_initialized():
         ray.init(
-            #num_gpus=gpu_count,
+            #num_gpus=num_gpus,
             num_cpus=config.ray_init.num_cpus,
-            dashboard_port=8265,  # Consistent with provided code
             runtime_env={
                 "env_vars": {
-                    "TOKENIZERS_PARALLELISM": "true",
-                    "NCCL_DEBUG": "WARN",
-                    "VLLM_LOGGING_LEVEL": "WARN",
+                    "TOKENIZERS_PARALLELISM": "false",
                     "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-                    "MASTER_ADDR": os.environ["MASTER_ADDR"],
-                    "MASTER_PORT": os.environ["MASTER_PORT"],
-                    "WORLD_SIZE": str(world_size),
-                    "RANK": os.environ["RANK"],
+                    "MASTER_ADDR": master_addr,
+                    "MASTER_PORT": master_port,
+                    "WORLD_SIZE": os.environ["WORLD_SIZE"],
                 }
             },
         )
-        print("run_c1: Ray initialized with resources:", ray.cluster_resources())
-        print("run_c1: Ray available resources:", ray.available_resources())
+
+
+        
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
 
-@ray.remote
-class MegatronActor:
-    def __init__(self, model, config):
-        import os
-        from megatron.core import mpu
-
-        self.model = model
-        self.config = config
-
-        # Initialize torch.distributed
-        if not torch.distributed.is_initialized():
-            rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            master_addr = os.environ.get("MASTER_ADDR", "localhost")
-            master_port = os.environ.get("MASTER_PORT", "29500")
-
-            torch.distributed.init_process_group(
-                backend="nccl",
-                init_method=f"tcp://{master_addr}:{master_port}",
-                rank=rank,
-                world_size=world_size
-            )
-
-        # Initialize Megatron parallelism
-        if not mpu.is_initialized():
-            mpu.initialize_model_parallel(
-                tensor_model_parallel_size=config.tensor_model_parallel_size,
-                pipeline_model_parallel_size=config.pipeline_model_parallel_size,
-                virtual_pipeline_model_parallel_size=config.get("virtual_pipeline_model_parallel_size", None),
-                context_parallel_size=config.get("context_parallel_size", 1),
-            )
-
-    def get_model(self):
-        return self.model
-
-    def get_state_dict(self):
-        return self.model.state_dict()
-
-    def cleanup(self):
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
-    def run(self, config):   
-        from verl.utils import hf_processor, hf_tokenizer
-        master_addr = os.environ.get("MASTER_ADDR", "localhost")
-        master_port = os.environ.get("MASTER_PORT", "8265")
-        # Initialize torch.distributed
-        print(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
-        if not True:
-        #if not torch.distributed.is_initialized():
-            world_size = int(os.environ.get("WORLD_SIZE", 8))
-            rank = int(os.environ.get("RANK", 1))
-            os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            # Check port availability
-            master_port = os.environ["MASTER_PORT"]
-            if not is_port_free(master_port):
-                raise RuntimeError(f"Port {master_port} is already in use. Choose a different MASTER_PORT for torch.distributed.init_process_group.")
-
-            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            torch.distributed.init_process_group(
-                backend="nccl" if gpu_count > 0 else "gloo",
-                init_method="env://",
-                world_size=world_size,
-                rank=rank,
-                timeout=datetime.timedelta(seconds=1800)  # 30 minutes timeout
-            )
-            print(f"TaskRunner: torch.distributed initialized: world_size={world_size}, rank={rank}, master_addr={master_addr}, master_port={master_port}, backend={'nccl' if gpu_count > 0 else 'gloo'}")
-
+    def run(self, config):
         # print initial config
         from pprint import pprint
+
         from omegaconf import OmegaConf
+
         from verl.utils.fs import copy_to_local
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
@@ -268,43 +196,6 @@ class TaskRunner:
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        # Check available GPUs
-        ray_available_resources = ray.cluster_resources()
-        available_gpus = int(ray_available_resources.get("GPU", 0))
-        logger.info(f"Ray available resources: {ray_available_resources}")
-        logger.info(f"Ray available GPUs: {available_gpus}")
-        
-        world_size = config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
-        total_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        if available_gpus < total_gpus:
-            logger.warning(
-                f"Available GPUs ({available_gpus}) is less than desired GPUs ({total_gpus}). "
-                f"Adjusting tensor_model_parallel_size and pipeline_model_parallel_size."
-            )
-            config.actor.megatron.tensor_model_parallel_size = available_gpus
-            config.actor.megatron.pipeline_model_parallel_size = 1
-            config.actor_rollout_ref.rollout.tensor_model_parallel_size = available_gpus
-            config.actor_rollout_ref.ref.megatron.tensor_model_parallel_size = available_gpus
-            config.actor_rollout_ref.ref.megatron.pipeline_model_parallel_size = 1
-            config.trainer.n_gpus_per_node = available_gpus
-            world_size = available_gpus
-        actors = []
-        for rank in range(world_size):
-            env = {
-                "RANK": str(rank),
-                "WORLD_SIZE": str(world_size),
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": master_port,
-                "CUDA_VISIBLE_DEVICES": str(rank % world_size),
-            }
-
-            actor = MegatronActor.options(
-                #num_cpus=config.ray_init.num_cpus,
-                num_gpus=1,
-                runtime_env={"env_vars": env}  # Use runtime_env to pass environment variables
-            ).remote(model=None, config=config.actor_rollout_ref.actor.megatron)
-            actors.append(actor)
-            
         trainer = AIGCodeC1Trainer(
             config=config,
             tokenizer=tokenizer,
@@ -316,13 +207,8 @@ class TaskRunner:
             val_reward_fn=val_reward_fn,
         )
         trainer.init_workers()
-        worker_group = NVMegatronRayWorkerGroup(actors, config=config.actor.megatron)
-        worker_group.world_size = world_size  # Set if needed
-        trainer.actor_rollout_wg = worker_group
         trainer.fit()
-        for actor in actors:
-            ray.get(actor.cleanup.remote())
-        ray.shutdown()
-        
+
+
 if __name__ == "__main__":
     main()

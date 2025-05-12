@@ -10,8 +10,8 @@ data:
   val_files: ~/data/rlhf/gsm8k/test.parquet
   prompt_key: prompt
   reward_fn_key: data_source
-  max_prompt_length: 512
-  max_response_length: 512
+  max_prompt_length: 512000
+  max_response_length: 512000
   train_batch_size: 1024
   val_batch_size: null # DEPRECATED: Validation datasets are sent to inference engines as a whole batch, which will schedule the memory themselves
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -20,9 +20,10 @@ data:
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
   filter_overlong_prompts_workers: 1
   truncation: error
+  max_samples: null
   custom_cls:
-      path: null
-      name: null
+      path: verl/utils/dataset/c1_rl_dataset.py
+      name: C1Dataset
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -224,11 +225,12 @@ algorithm:
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
-  #type: "aigcode_c1"  # Options: "ppo", "aigcode_c1"
+  type: "aigcode_c1"  # Options: "ppo", "aigcode_c1"
   use_vapo: true
-  gamma: 0.99
-  lam: 0.95
-  #kl_penalty: 0.01
+  gamma: 1.0
+  lam: 1.0
+  difficulty_mode: k_fold
+
 
 trainer:
   balance_batch: True

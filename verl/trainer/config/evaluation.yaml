@@ -4,7 +4,8 @@ data:
   response_key: responses
   data_source_key: data_source
   reward_model_key: reward_model
-
+  max_samples: null
+  
 custom_reward_function:
   path: null
   name: compute_score
