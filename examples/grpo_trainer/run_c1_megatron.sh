@@ -90,7 +90,9 @@ fi
 
 train_files="['$TRAIN_FILE']"
 test_files="['$TEST_FILE']"
-sequence_len=4096
+
+#sequence_len=4096
+sequence_len=3072
 difficulty_mode="k_fold"
 #    --config-name='ppo_megatron_trainer.yaml'\
 python3 -m verl.trainer.main_aigcode_c1 --config-path=config \
