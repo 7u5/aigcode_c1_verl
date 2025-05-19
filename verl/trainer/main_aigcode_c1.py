@@ -316,9 +316,9 @@ class TaskRunner:
             val_reward_fn=val_reward_fn,
         )
         trainer.init_workers()
-        worker_group = NVMegatronRayWorkerGroup(actors, config=config.actor.megatron)
-        worker_group.world_size = world_size  # Set if needed
-        trainer.actor_rollout_wg = worker_group
+        #worker_group = NVMegatronRayWorkerGroup(actors, config=config.actor.megatron)
+        #worker_group.world_size = world_size  # Set if needed
+        #trainer.actor_rollout_wg = worker_group
         trainer.fit()
         for actor in actors:
             ray.get(actor.cleanup.remote())

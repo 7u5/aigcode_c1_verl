@@ -1,0 +1,26 @@
+pip install -r requirements.txt
+pip install Apex
+pip install torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 
+pip install -U torchvision
+pip install -U torchaudio
+
+# maybe need to install cmake
+sudo apt remove cmake
+export all_proxy="http://192.168.128.250:18000"
+wget https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.sh
+chmod +x cmake-3.28.3-linux-x86_64.sh
+sudo ./cmake-3.28.3-linux-x86_64.sh --prefix=/usr/local --exclude-subdir
+
+sudo ln -sf /usr/local/cmake/bin/cmake /usr/bin/cmake
+
+# install vllm by compile
+git clone --recursive https://github.com/vllm-project/vllm.git
+cd vllm
+export MAX_JOBS=16
+pip install -e .
+
+# back to main dir to install c1 
+cd ..
+pip install -e .
+
+export all_proxy="http://192.168.128.250:18000";logfile=`date '+%Y%m%d_%H%M_%S'`;nohup bash examples/grpo_trainer/run_c1_megatron.sh > c1_${logfile}.log 2>&1 &

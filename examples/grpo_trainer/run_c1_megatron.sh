@@ -68,6 +68,7 @@ HYDRA_FULL_ERROR=1
 export PYTHONPATH=/sharedata/qiuwu/c1:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
+#export all_proxy="http://192.168.128.250:18000"
 
 train_path=BytedTsinghua-SIA/DAPO-Math-17k
 train_dir=$(echo "$train_path" | tr '/' '_')
