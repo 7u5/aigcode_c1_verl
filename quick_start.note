@@ -3,6 +3,7 @@ pip install Apex
 pip install torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 
 pip install -U torchvision
 pip install -U torchaudio
+pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable
 
 # maybe need to install cmake
 sudo apt remove cmake
@@ -18,6 +19,7 @@ git clone --recursive https://github.com/vllm-project/vllm.git
 cd vllm
 export MAX_JOBS=16
 pip install -e .
+
 
 # back to main dir to install c1 
 cd ..

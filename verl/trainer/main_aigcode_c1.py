@@ -100,7 +100,7 @@ def run_c1(config) -> None:
         ray.init(
             #num_gpus=gpu_count,
             num_cpus=config.ray_init.num_cpus,
-            dashboard_port=8265,  # Consistent with provided code
+            dashboard_port=8888,  # Consistent with provided code
             runtime_env={
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true",
@@ -169,25 +169,6 @@ class TaskRunner:
         master_port = os.environ.get("MASTER_PORT", "8265")
         # Initialize torch.distributed
         print(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
-        if not True:
-        #if not torch.distributed.is_initialized():
-            world_size = int(os.environ.get("WORLD_SIZE", 8))
-            rank = int(os.environ.get("RANK", 1))
-            os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            # Check port availability
-            master_port = os.environ["MASTER_PORT"]
-            if not is_port_free(master_port):
-                raise RuntimeError(f"Port {master_port} is already in use. Choose a different MASTER_PORT for torch.distributed.init_process_group.")
-
-            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            torch.distributed.init_process_group(
-                backend="nccl" if gpu_count > 0 else "gloo",
-                init_method="env://",
-                world_size=world_size,
-                rank=rank,
-                timeout=datetime.timedelta(seconds=1800)  # 30 minutes timeout
-            )
-            print(f"TaskRunner: torch.distributed initialized: world_size={world_size}, rank={rank}, master_addr={master_addr}, master_port={master_port}, backend={'nccl' if gpu_count > 0 else 'gloo'}")
 
         # print initial config
         from pprint import pprint
@@ -267,7 +248,7 @@ class TaskRunner:
         )
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-
+        '''
         # Check available GPUs
         ray_available_resources = ray.cluster_resources()
         available_gpus = int(ray_available_resources.get("GPU", 0))
@@ -304,6 +285,7 @@ class TaskRunner:
                 runtime_env={"env_vars": env}  # Use runtime_env to pass environment variables
             ).remote(model=None, config=config.actor_rollout_ref.actor.megatron)
             actors.append(actor)
+        '''
             
         trainer = AIGCodeC1Trainer(
             config=config,
@@ -320,9 +302,6 @@ class TaskRunner:
         #worker_group.world_size = world_size  # Set if needed
         #trainer.actor_rollout_wg = worker_group
         trainer.fit()
-        for actor in actors:
-            ray.get(actor.cleanup.remote())
-        ray.shutdown()
         
 if __name__ == "__main__":
     main()
