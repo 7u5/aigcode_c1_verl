@@ -36,7 +36,23 @@ class NVMegatronRayWorkerGroup(RayWorkerGroup, MegatronWorkerGroup):
             self.execute_rank_zero_async(method_name="get_megatron_global_info")
         )
 
+    @ray.remote
+    def generate_sequences(self, prompts):
+        # Forward the call to all actors and aggregate results
+        results = ray.get([actor.generate_sequences.remote(prompts) for actor in self.actors])
+        # Aggregate results (e.g., concatenate or process as needed)
+        return results[0]  # Simplified; adjust based on actual logic
 
+    @ray.remote
+    def compute_log_prob(self, data):
+        results = ray.get([actor.compute_log_prob.remote(data) for actor in self.actors])
+        return results[0]
+
+    @ray.remote
+    def update_actor(self, data):
+        results = ray.get([actor.update_actor.remote(data) for actor in self.actors])
+        return results[0]
+    
 class MegatronRayWorkerGroup(RayWorkerGroup, MegatronWorkerGroup):
     """
     MegatronWorkerGroup will query each worker of its megatron rank info and store it inside the WorkerGroup

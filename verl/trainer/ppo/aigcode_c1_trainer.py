@@ -287,8 +287,66 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
         optimizer = get_megatron_optimizer(model=meta_model, config=optim_config)
         return optimizer, meta_model        
-        
+
     def get_model_and_optim(self, config):
+        from megatron.core import mpu
+        import torch
+        from megatron.core.models.gpt import GPTModel
+        from verl.utils.megatron_utils import get_megatron_optimizer, init_megatron_optim_config
+
+        # Debug environment and distributed state
+        env_vars = {k: v for k, v in os.environ.items() if k in ['WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES']}
+        print(f"get_model_and_optim: Environment variables: {env_vars}")
+        print(f"get_model_and_optim: torch.distributed initialized: {torch.distributed.is_initialized()}")
+        print(f"get_model_and_optim: Available GPUs: {torch.cuda.device_count()}")
+
+        # Ensure distributed process group is initialized
+        if not torch.distributed.is_initialized():
+            rank = int(os.environ.get("RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            master_addr = os.environ.get("MASTER_ADDR", "localhost")
+            master_port = os.environ.get("MASTER_PORT", "8265")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=world_size,
+                rank=rank
+            )
+            torch.cuda.set_device(rank)
+
+        # Ensure Megatron parallelism is initialized
+        if not mpu.is_initialized():
+            mpu.initialize_model_parallel(
+                tensor_model_parallel_size=config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size,
+                pipeline_model_parallel_size=config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=config.actor_rollout_ref.actor.megatron.get("virtual_pipeline_model_parallel_size", None),
+                context_parallel_size=config.actor_rollout_ref.actor.megatron.get("context_parallel_size", 1),
+                use_sharp=False,
+                nccl_communicator_config_path=None,
+            )
+
+        # Aggregate state dictionaries from worker group actors
+        actors = self.actor_rollout_wg.actors  # Access actors attribute
+        global_state_dict = aggregate_state_dicts(actors, config=self.get_model_config())
+
+        # Create meta-model
+        transformer_config = self.get_model_config()
+        meta_model = GPTModel(transformer_config)
+
+        # Load aggregated state dictionary
+        meta_model.load_state_dict(global_state_dict)
+
+        # Handle pipeline parallelism
+        if isinstance(meta_model, list):
+            meta_model = meta_model[0]
+
+        # Initialize optimizer
+        optim_config = init_megatron_optim_config(config.actor_rollout_ref.actor.optim)
+        optimizer = get_megatron_optimizer(model=meta_model, config=optim_config)
+
+        return optimizer, meta_model
+
+    def get_model_and_optim_backup(self, config):
         # Assume config is defined (Megatron configuration)
         # Assume self.actor_rollout_wg is a list of Ray actors
         global_state_dict = aggregate_state_dicts(self.actor_rollout_wg, self.get_model_config())
@@ -471,10 +529,9 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         return optimizer, model
      
      
-    def _inner_loop_adaptation(self, batch: 'DataProto') -> dict:
+    def _inner_loop_adaptation(self, batch: 'DataProto', optimizer = None) -> dict:
         # Fetch model and optimizer state from actor_rollout_wg
-        optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
-
+        #optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
         for _ in range(self.inner_steps):
             optimizer.zero_grad()
             loss = 0
@@ -545,12 +602,18 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        meta_optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
-    
+        # Debug actor_rollout_wg initialization
+        print(f"actor_rollout_wg type: {type(self.actor_rollout_wg)}")
+        print(f"actor_rollout_wg attributes: {dir(self.actor_rollout_wg)}")
+        
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
         self.global_steps += 1
         last_val_metrics = None
 
+        # Initialize meta_optimizer after workers are set up
+        print("------------------- meta_optim, initializing after worker init -----------------")
+        meta_optimizer = None  # Will be initialized in the first iteration if needed
+          
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -571,13 +634,14 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                 with _timer("step", timing_raw):
                     with _timer("gen", timing_raw):
-                        gen_batch_output = ray.get(self.actor_rollout_wg.generate_sequences.remote(gen_batch))
+                        #gen_batch_output = ray.get(self.actor_rollout_wg.generate_sequences.remote(gen_batch))
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = ray.get(self.actor_rollout_wg.generate_sequences.remote(gen_baseline_batch))
+                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
@@ -667,9 +731,13 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                         with _timer("meta_update", timing_raw):
+                            # Initialize meta_optimizer if not already done
+                            if meta_optimizer is None:
+                                print("------------------- Initializing meta_optimizer -----------------")
+                                meta_optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
                             meta_optimizer.zero_grad()
                             for _ in range(self.meta_steps):
-                                adapted_state = self._inner_loop_adaptation(batch)
+                                adapted_state = self._inner_loop_adaptation(batch, meta_optimizer)
                                 self._set_worker_parameters(self.actor_rollout_wg, adapted_state["parameters"])
                                 meta_loss = (
                                     self._compute_value_aware_loss(batch)

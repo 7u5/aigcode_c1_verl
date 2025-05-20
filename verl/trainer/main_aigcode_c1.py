@@ -248,44 +248,6 @@ class TaskRunner:
         )
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-        '''
-        # Check available GPUs
-        ray_available_resources = ray.cluster_resources()
-        available_gpus = int(ray_available_resources.get("GPU", 0))
-        logger.info(f"Ray available resources: {ray_available_resources}")
-        logger.info(f"Ray available GPUs: {available_gpus}")
-        
-        world_size = config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
-        total_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        if available_gpus < total_gpus:
-            logger.warning(
-                f"Available GPUs ({available_gpus}) is less than desired GPUs ({total_gpus}). "
-                f"Adjusting tensor_model_parallel_size and pipeline_model_parallel_size."
-            )
-            config.actor.megatron.tensor_model_parallel_size = available_gpus
-            config.actor.megatron.pipeline_model_parallel_size = 1
-            config.actor_rollout_ref.rollout.tensor_model_parallel_size = available_gpus
-            config.actor_rollout_ref.ref.megatron.tensor_model_parallel_size = available_gpus
-            config.actor_rollout_ref.ref.megatron.pipeline_model_parallel_size = 1
-            config.trainer.n_gpus_per_node = available_gpus
-            world_size = available_gpus
-        actors = []
-        for rank in range(world_size):
-            env = {
-                "RANK": str(rank),
-                "WORLD_SIZE": str(world_size),
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": master_port,
-                "CUDA_VISIBLE_DEVICES": str(rank % world_size),
-            }
-
-            actor = MegatronActor.options(
-                #num_cpus=config.ray_init.num_cpus,
-                num_gpus=1,
-                runtime_env={"env_vars": env}  # Use runtime_env to pass environment variables
-            ).remote(model=None, config=config.actor_rollout_ref.actor.megatron)
-            actors.append(actor)
-        '''
             
         trainer = AIGCodeC1Trainer(
             config=config,
