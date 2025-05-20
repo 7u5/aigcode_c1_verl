@@ -671,7 +671,8 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     with _timer("old_log_prob", timing_raw):
-                        old_log_prob = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
+                        #old_log_prob = ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -685,12 +686,13 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                     if self.use_reference_policy:
                         with _timer("ref", timing_raw):
-                            ref_log_prob = ray.get(self.ref_policy_wg.compute_ref_log_prob.remote(batch))
+                            #ref_log_prob = ray.get(self.ref_policy_wg.compute_ref_log_prob.remote(batch))
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     if self.use_critic:
                         with _timer("values", timing_raw):
-                            values = ray.get(self.critic_wg.compute_values.remote(batch))
+                            values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
                     with _timer("adv", timing_raw):
@@ -720,13 +722,13 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
-                            critic_output = ray.get(self.critic_wg.update_critic.remote(batch))
+                            critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with _timer("update_actor", timing_raw):
-                            actor_output = ray.get(self.actor_rollout_wg.update_actor.remote(batch))
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -743,7 +745,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                                     self._compute_value_aware_loss(batch)
                                     if self.use_vapo
                                     else -torch.mean(
-                                        ray.get(self.actor_rollout_wg.compute_log_prob.remote(batch))["log_probs"]
+                                        self.actor_rollout_wg.compute_log_prob(batch)["log_probs"]
                                         * batch.batch["advantages"]
                                     )
                                 )
