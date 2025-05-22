@@ -516,7 +516,7 @@ class ActorRolloutRefWorker(MegatronWorker):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
         torch.cuda.empty_cache()
-        return output
+        return output, self.actor.actor_module
 
     @register(dispatch_mode=Dispatch.MEGATRON_PP_AS_DP_PROTO)
     def generate_sequences(self, prompts: DataProto):
@@ -757,7 +757,7 @@ class CriticWorker(MegatronWorker):
         metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
         output = DataProto(batch=None, meta_info={"metrics": metrics})
         output = output.to("cpu")
-        return output
+        return output, self.critic.critic_module
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, checkpoint_path, hdfs_path=None, del_local_after_load=True):

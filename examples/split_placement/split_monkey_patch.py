@@ -176,7 +176,7 @@ def fit(self):
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     # update actor
                     with _timer("update_actor_call", timing_raw):
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output, _ = self.actor_rollout_wg.update_actor(batch)
 
                 # NOTE: make sure you set blocking=False in update_actor and update_crtic in the worker class
                 with _timer("update_actor_critic", timing_raw):

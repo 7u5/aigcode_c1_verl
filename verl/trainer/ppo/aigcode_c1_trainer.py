@@ -624,13 +624,13 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_output, critic_module = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with _timer("update_actor", timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output, actor_module = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
                         
@@ -640,7 +640,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                             if meta_optimizer is None:
                                 print("------------------- Initializing meta_optimizer -----------------")
                                 #meta_optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
-                                meta_optimizer = self.get_combined_optimizer(self.actor_rollout_wg.actor_module, self.actor_rollout_re, self.config.actor_rollout_ref)
+                                meta_optimizer = self.get_combined_optimizer(actor_module, critic_module, self.config.actor_rollout_ref)
                             meta_optimizer.zero_grad()
                             for _ in range(self.meta_steps):
                                 adapted_state = self._inner_loop_adaptation(batch, meta_optimizer)
