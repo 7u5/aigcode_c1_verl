@@ -280,19 +280,12 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         delta = batch.batch.get("difficulty_coeff", torch.tensor(1.0, device=self.device))
         value_aware_loss = -torch.mean(delta * log_probs * advantages * values)
         return value_aware_loss
-    
-    def get_optim(self, config):
-        from verl.utils.model import get_parallel_gptmodel_from_config
-        meta_model = get_parallel_gptmodel_from_config()
-        optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
-        optimizer = get_megatron_optimizer(model=meta_model, config=optim_config)
-        return optimizer, meta_model        
 
     def get_model_and_optim(self, config):
         from megatron.core import mpu
         import torch
         from megatron.core.models.gpt import GPTModel
-        from verl.utils.megatron_utils import get_megatron_optimizer, init_megatron_optim_config
+        from verl.utils.megatron_utils import init_megatron_optim_config
 
         # Debug environment and distributed state
         env_vars = {k: v for k, v in os.environ.items() if k in ['WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES']}
@@ -301,6 +294,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
         print(f"get_model_and_optim: Available GPUs: {torch.cuda.device_count()}")
 
         # Ensure distributed process group is initialized
+        
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", "0"))
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -313,6 +307,11 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                 rank=rank
             )
             torch.cuda.set_device(rank)
+        else:
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            backend = torch.distributed.get_backend()
+            
 
         # Ensure Megatron parallelism is initialized
         if not mpu.is_initialized():
@@ -346,43 +345,22 @@ class AIGCodeC1Trainer(RayPPOTrainer):
 
         return optimizer, meta_model
 
-    def get_model_and_optim_backup(self, config):
-        # Assume config is defined (Megatron configuration)
-        # Assume self.actor_rollout_wg is a list of Ray actors
-        global_state_dict = aggregate_state_dicts(self.actor_rollout_wg, self.get_model_config())
+    def get_combined_optimizer(self, actor_model: GPTModel, meta_model: GPTModel, config) -> torch.optim.Optimizer:
+        """
+        Create a single optimizer for both actor and meta-model parameters.
+        """
+        optim_config = init_megatron_optim_config(config.actor_rollout_ref.actor.optim)
+        
+        # Collect parameters from both models
+        actor_params = [{"params": [p for p in actor_model.parameters() if p.requires_grad], "name": "actor"}]
+        meta_params = [{"params": [p for p in meta_model.parameters() if p.requires_grad], "name": "meta"}]
+        combined_params = actor_params + meta_params
 
-        # Create a non-sharded model for meta-learning
-        meta_model = GPTModel(config)
-        meta_model.load_state_dict(global_state_dict)
-        if isinstance(meta_model, list):
-            meta_model = meta_model[0]
-        # Create meta-optimizer
-        optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
-        optimizer = get_megatron_optimizer(model=meta_model, config=optim_config)
-        return optimizer, meta_model
-
-        # Meta-learning loop (simplified)
-        '''
-        for meta_task_data, tasks in meta_learning_dataset:
-            # Inner-loop training
-            task_state_dicts = []
-            for actor, task_data in zip(self.actor_rollout_wg, tasks):
-                @ray.remote
-                def inner_loop(actor, task_data):
-                    model = ray.get(actor.get_model.remote())
-                    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-                    for data in task_data:
-                        loss = compute_loss(model, data)  # Define compute_loss
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                    return ray.get(actor.get_state_dict.remote())
-                task_state_dicts.append(ray.get(inner_loop.remote(actor, task_data)))
-
-            # Aggregate updated parameters
-            global_state_dict = aggregate_state_dicts(task_state_dicts, config)
-            meta_model.load_state_dict(global_state_dict)
-        '''
+        logger.info(f"Combined optimizer: {len(actor_params[0]['params'])} actor params, {len(meta_params[0]['params'])} meta params")
+        
+        # Create optimizer
+        optimizer = get_megatron_optimizer(model=None, config=optim_config, params=combined_params)
+        return optimizer
 
 
     def get_model_and_optimizer_state(self):
@@ -451,83 +429,7 @@ class AIGCodeC1Trainer(RayPPOTrainer):
             return model
         return model_provider_func
 
-    def get_model_and_optim2(self, config):
-        model = self.get_model_and_optimizer_state()
-        if isinstance(model, list):
-            model = model[0]
-        optim_config = init_megatron_optim_config(config.actor.optim)
-        optimizer = get_megatron_optimizer(model=model, config=optim_config)
-        return optimizer, model
-       
-    
-    def get_model_and_optim3(self, config):
-        from megatron.core import mpu
-        env_vars = {k: v for k, v in os.environ.items() if k in ['WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT', 'CUDA_VISIBLE_DEVICES']}
-        print("get_model_and_optim: Environment variables:", env_vars)
-        print("get_model_and_optim: torch.distributed initialized:", torch.distributed.is_initialized())
-        print("get_model_and_optim: Available GPUs:", torch.cuda.device_count())
-        print("get_model_and_optim: actor_rollout_wg attributes:", dir(self.actor_rollout_wg))
 
-        # Validate distributed context
-        if not torch.distributed.is_initialized():
-            raise RuntimeError("torch.distributed is not initialized. Ensure TaskRunner or NVMegatronRayWorkerGroup sets up the distributed context.")
-
-        # Validate world_size
-        world_size = torch.distributed.get_world_size()
-        required_gpus = config.actor.megatron.tensor_model_parallel_size * config.actor.megatron.pipeline_model_parallel_size
-        if world_size != required_gpus:
-            raise ValueError(f"world_size ({world_size}) does not match required GPUs ({required_gpus}) for tensor_model_parallel_size={config.actor.megatron.tensor_model_parallel_size} and pipeline_model_parallel_size={config.actor.megatron.pipeline_model_parallel_size}")
-
-        # Initialize Megatron parallelism
-        print("get_model_and_optim: Initializing Megatron model parallel")
-        if not mpu.is_initialized():
-            mpu.initialize_model_parallel(
-                tensor_model_parallel_size=config.actor.megatron.tensor_model_parallel_size,
-                pipeline_model_parallel_size=config.actor.megatron.pipeline_model_parallel_size
-            )
-
-        # Create model provider and initialize model
-        model_provider = self.create_model_provider(self.config.actor_rollout_ref)
-        model = get_model(
-            model_provider_func=model_provider,
-            model_type=ModelType.encoder_or_decoder,
-            wrap_with_ddp=True,
-            use_distributed_optimizer=True
-        )
-
-        # Handle pipeline parallelism
-        if isinstance(model, list):
-            model = model[0]
-
-        # Initialize optimizer
-        optim_config = init_megatron_optim_config(self.config.actor_rollout_ref.actor.optim)
-        optimizer = get_megatron_optimizer(model=model, config=optim_config)
-        return optimizer, model
-    
-    def get_model_and_optim_bad(self, config):
-        # Initialize optimizer config
-        optim_config = init_megatron_optim_config(config.actor.optim)
-        def megatron_value_model_provider(pre_process, post_process):
-            from verl.utils.model import get_parallel_gptmodel_from_config
-            parallel_model = get_parallel_gptmodel_from_config(
-                hf_to_mcore_config(config, torch.bfloat16), config, pre_process, post_process, share_embeddings_and_output_weights=False, value=True
-            )
-            parallel_model.cuda()
-            return parallel_model
-        
-        model = self.model if self.model is not None else get_model(
-            model_provider_func=megatron_value_model_provider,
-            model_type=ModelType.encoder_or_decoder,
-            wrap_with_ddp=True,
-        )
-        
-        # Handle pipeline parallelism: select the first model if a list is returned
-        if isinstance(model, list):
-            model = model[0]
-            
-        optimizer = get_megatron_optimizer(model=model, config=optim_config)
-        return optimizer, model
-     
      
     def _inner_loop_adaptation(self, batch: 'DataProto', optimizer = None) -> dict:
         # Fetch model and optimizer state from actor_rollout_wg
@@ -731,12 +633,14 @@ class AIGCodeC1Trainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
+                        
+                    if self.config.meta_learning:
                         with _timer("meta_update", timing_raw):
                             # Initialize meta_optimizer if not already done
                             if meta_optimizer is None:
                                 print("------------------- Initializing meta_optimizer -----------------")
-                                meta_optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
+                                #meta_optimizer, _ = self.get_model_and_optim(self.config.actor_rollout_ref)
+                                meta_optimizer = self.get_combined_optimizer(self.actor_rollout_wg.actor_module, self.actor_rollout_re, self.config.actor_rollout_ref)
                             meta_optimizer.zero_grad()
                             for _ in range(self.meta_steps):
                                 adapted_state = self._inner_loop_adaptation(batch, meta_optimizer)
